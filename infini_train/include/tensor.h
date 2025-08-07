@@ -10,6 +10,7 @@
 #include "Eigen/Dense"
 #include "glog/logging.h"
 
+#include "infini_train/include/datatype.h"
 #include "infini_train/include/device.h"
 
 namespace infini_train {
@@ -32,21 +33,6 @@ struct PrintOptions {
     }
 };
 } // namespace
-
-enum class DataType : int8_t {
-    kUINT8,
-    kINT8,
-    kUINT16,
-    kINT16,
-    kUINT32,
-    kINT32,
-    kUINT64,
-    kINT64,
-    kBFLOAT16,
-    kFLOAT16,
-    kFLOAT32,
-    kFLOAT64,
-};
 
 class TensorBuffer {
 public:

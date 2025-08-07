@@ -25,36 +25,6 @@
 #include "infini_train/include/nn/init.h"
 
 namespace infini_train {
-namespace {
-const std::unordered_map<DataType, size_t> kDataTypeToSize = {
-    {DataType::kUINT8, 1},    {DataType::kINT8, 1},    {DataType::kUINT16, 2},  {DataType::kINT16, 2},
-    {DataType::kUINT32, 4},   {DataType::kINT32, 4},   {DataType::kUINT64, 8},  {DataType::kINT64, 8},
-    {DataType::kBFLOAT16, 2}, {DataType::kFLOAT16, 2}, {DataType::kFLOAT32, 4}, {DataType::kFLOAT64, 8},
-};
-
-const std::unordered_map<DataType, std::string> kDataTypeToDesc = {
-    {DataType::kUINT8, "uint8"},   {DataType::kINT8, "int8"},     {DataType::kUINT16, "uint16"},
-    {DataType::kINT16, "int16"},   {DataType::kUINT32, "uint32"}, {DataType::kINT32, "int32"},
-    {DataType::kUINT64, "uint64"}, {DataType::kINT64, "int64"},   {DataType::kBFLOAT16, "bf16"},
-    {DataType::kFLOAT16, "fp16"},  {DataType::kFLOAT32, "fp32"},  {DataType::kFLOAT64, "fp64"},
-};
-
-template <DataType DType> struct TypeMap;
-
-template <> struct TypeMap<DataType::kFLOAT32> {
-    using type = float;
-};
-template <> struct TypeMap<DataType::kFLOAT64> {
-    using type = double;
-};
-template <> struct TypeMap<DataType::kINT32> {
-    using type = int32_t;
-};
-template <> struct TypeMap<DataType::kINT64> {
-    using type = int64_t;
-};
-} // namespace
-
 TensorBuffer::TensorBuffer(Device device, size_t size) : device_(device), size_(size) {
     switch (device_.Type()) {
     case DeviceType::kCPU:
@@ -122,44 +92,36 @@ size_t Tensor::NumElements() const { return num_elements_; }
 DataType Tensor::Dtype() const { return dtype_; }
 
 template <typename T> void Tensor::Fill(T value) {
+    auto device = GetDevice();
+    device.SetDevice();
+
     DataType dtype = Dtype();
 
     uint64_t storage = 0;
 
-    switch (dtype) {
-    case DataType::kFLOAT32: {
-        using TargetT = typename TypeMap<DataType::kFLOAT32>::type;
+    DispatchFunc<INFINI_ALL_TYPES>(Dtype(), [&storage, value]<typename TargetT>() {
         TargetT casted_value = static_cast<TargetT>(value);
-        std::memcpy(&storage, &casted_value, sizeof(TargetT));
-        break;
-    }
-    case DataType::kFLOAT64: {
-        using TargetT = typename TypeMap<DataType::kFLOAT64>::type;
-        TargetT casted_value = static_cast<TargetT>(value);
-        std::memcpy(&storage, &casted_value, sizeof(TargetT));
-        break;
-    }
-    case DataType::kINT32: {
-        using TargetT = typename TypeMap<DataType::kINT32>::type;
-        TargetT casted_value = static_cast<TargetT>(value);
-        std::memcpy(&storage, &casted_value, sizeof(TargetT));
-        break;
-    }
-    case DataType::kINT64: {
-        using TargetT = typename TypeMap<DataType::kINT64>::type;
-        TargetT casted_value = static_cast<TargetT>(value);
-        std::memcpy(&storage, &casted_value, sizeof(TargetT));
-        break;
-    }
-    default:
-        throw std::runtime_error("Unsupported data type in Tensor::Fill()");
-    }
+        std::memcpy((void *)(&storage), &casted_value, sizeof(TargetT));
+    });
 
-    auto kernel = Dispatcher::Instance().GetKernel({GetDevice().Type(), "Fill"});
+    auto kernel = Dispatcher::Instance().GetKernel({device.Type(), "Fill"});
     kernel.Call<void>(shared_from_this(), static_cast<void *>(&storage));
 }
 
+template void Tensor::Fill<uint8_t>(uint8_t);
+template void Tensor::Fill<int8_t>(int8_t);
+template void Tensor::Fill<uint16_t>(uint16_t);
+template void Tensor::Fill<int16_t>(int16_t);
+template void Tensor::Fill<uint32_t>(uint32_t);
+template void Tensor::Fill<int32_t>(int32_t);
+template void Tensor::Fill<uint64_t>(uint64_t);
+template void Tensor::Fill<int64_t>(int64_t);
 template void Tensor::Fill<float>(float);
+template void Tensor::Fill<double>(double);
+#ifdef USE_CUDA
+template void Tensor::Fill<nv_bfloat16>(nv_bfloat16);
+template void Tensor::Fill<half>(half);
+#endif
 
 Eigen::Map<Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> Tensor::EigenMatrix() {
     const int64_t bs = std::accumulate(dims_.rbegin() + 1, dims_.rend(), 1, std::multiplies<int64_t>());
@@ -279,11 +241,25 @@ std::shared_ptr<Tensor> Tensor::Contiguous() {
 std::shared_ptr<Tensor> Tensor::Flatten(int64_t start, int64_t end) {
     // return Contiguous()->View(new_shape);
     // =================================== 作业 ===================================
-    // TODO：实现张量扁平化操作，将指定维度范围[start, end]内的所有维度合并为一个维度
-    // HINT:
-    // =================================== 作业 ===================================
+    auto ndim = dims_.size();
+    auto start_dim = start >= 0 ? start : start + ndim;
+    auto end_dim = end >= 0 ? end : end + ndim;
+    CHECK(start_dim >= 0 && end_dim >= start_dim && end_dim <= ndim);
 
-    return std::make_shared<Tensor>();
+    std::vector<int64_t> new_shape;
+    int64_t flatten_size = 1;
+    for (int64_t i = 0; i < ndim; ++i) {
+        if (i < start_dim || i > end_dim) {
+            new_shape.push_back(dims_[i]);
+        } else {
+            flatten_size *= dims_[i];
+            if (i == end_dim) {
+                new_shape.push_back(flatten_size);
+            }
+        }
+    }
+
+    return Contiguous()->View(new_shape);
 }
 
 std::shared_ptr<Tensor> Tensor::Squeeze(int64_t dim) {
@@ -355,9 +331,20 @@ std::shared_ptr<Tensor> Tensor::RequiresGrad() {
 
 void Tensor::Backward(std::shared_ptr<Tensor> gradient, bool retain_graph, bool create_graph) const {
     // =================================== 作业 ===================================
-    // TODO：实现自动微分反向传播
-    // 功能描述：1. 计算当前张量对叶子节点的梯度    2. 支持多输出场景的梯度累加
-    // =================================== 作业 ===================================
+    CHECK(!retain_graph && !create_graph) << "Not implemented yet!";
+    if (grad_fn_) {
+        if (!gradient) {
+            CHECK_EQ(dims_.size(), 0);
+            gradient = std::make_shared<Tensor>(std::vector<int64_t>{}, dtype_, GetDevice());
+            gradient->Fill<float>(1.0f);
+        } else {
+            CHECK_EQ(static_cast<int>(GetDevice().Type()), static_cast<int>(gradient->GetDevice().Type()));
+            CHECK_EQ(static_cast<int>(dtype_), static_cast<int>(gradient->Dtype()));
+            CHECK_EQ(dims_.size(), gradient->Dims().size());
+            for (int idx = 0; idx < dims_.size(); ++idx) { CHECK_EQ(dims_[idx], gradient->Dims()[idx]); }
+        }
+        grad_fn_->BackwardPartial(gradient, output_idx_);
+    }
 }
 
 void Tensor::ZeroGrad() {

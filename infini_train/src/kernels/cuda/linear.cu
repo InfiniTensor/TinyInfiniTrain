@@ -2,6 +2,7 @@
 #include "glog/logging.h"
 #include <cub/block/block_reduce.cuh>
 
+#include "infini_train/include/common/cuda/common_cuda.cuh"
 #include "infini_train/include/dispatcher.h"
 #include "infini_train/include/tensor.h"
 
@@ -25,11 +26,65 @@ namespace infini_train::kernels::cuda {
 
 std::shared_ptr<Tensor> MatmulForward(const std::shared_ptr<Tensor> &input, const std::shared_ptr<Tensor> &other) {
     // =================================== 作业 ===================================
-    // TODO：实现CUDA上的矩阵乘法前向计算
-    // REF:
-    // =================================== 作业 ===================================
+    /*
+     output[*, m, n] = input[*, m, k] * other[*, k, n]
+     */
+    const auto &input_dims = input->Dims();
+    const auto &other_dims = other->Dims();
 
-    auto output = std::make_shared<Tensor>();
+    CHECK_GE(input_dims.size(), 2);
+    CHECK_GE(other_dims.size(), 2);
+    CHECK_EQ(input_dims.size(), other_dims.size());
+
+    const int64_t m = input_dims[input_dims.size() - 2];
+    const int64_t k = input_dims[input_dims.size() - 1];
+    CHECK_EQ(k, other_dims[other_dims.size() - 2]);
+    const int64_t n = other_dims[other_dims.size() - 1];
+
+    const int64_t bs = std::accumulate(input_dims.rbegin() + 2, input_dims.rend(), 1, std::multiplies<int64_t>{});
+    for (int64_t i = 0; i < input_dims.size() - 2; ++i) {
+        CHECK_EQ(input_dims[i], other_dims[i]) << "Batch dims must match";
+    }
+
+    auto dtype = input->Dtype();
+    std::vector<int64_t> output_dims = input_dims;
+    output_dims[output_dims.size() - 1] = n;
+    auto output = std::make_shared<Tensor>(output_dims, dtype, input->GetDevice());
+
+    const auto *cuda_device = dynamic_cast<const CudaDevice *>(
+        DeviceManager::Instance()->GetDevice(DeviceType::kCUDA, input->GetDevice().Index()));
+    const float alpha = 1.0f, beta = 0.0f;
+    cublasHandle_t handle = cuda_device->CublasHandle();
+
+    // cuBLAS is colmun-major
+    // output = input * other --> output.T = other.T * input.T
+    // C = A * B ==> output.T[*, n, m] = other.T[*, n, k] * input.T[*, k, m]
+    // C = output.T[*, n, m]
+    // A = other.T[*, n, k]
+    // B = input.T[*, k, m]
+    int lda = n;
+    int ldb = k;
+    int ldc = n;
+    int64_t stride_a = n * k;
+    int64_t stride_b = k * m;
+    int64_t stride_c = m * n;
+    // NOTE(zbl): the last cublasGemmAlgo_t param has no effect on GPU arch >= sm_80(Ampere)
+
+    switch (dtype) {
+        DISPATCH_CASE(WRAP(CUBLAS_CHECK(cublasGemmStridedBatchedEx(
+                          handle, CUBLAS_OP_N, CUBLAS_OP_N, n, m, k, &alpha, other->DataPtr(), CUDA_R_32F, lda,
+                          stride_a, input->DataPtr(), CUDA_R_32F, ldb, stride_b, &beta, output->DataPtr(), CUDA_R_32F,
+                          ldc, stride_c, bs, CUDA_R_32F, CUBLAS_GEMM_DEFAULT));),
+                      DataType::kFLOAT32)
+        DISPATCH_CASE(WRAP(CUBLAS_CHECK(cublasGemmStridedBatchedEx(
+                          handle, CUBLAS_OP_N, CUBLAS_OP_N, n, m, k, &alpha, other->DataPtr(), CUDA_R_16BF, lda,
+                          stride_a, input->DataPtr(), CUDA_R_16BF, ldb, stride_b, &beta, output->DataPtr(), CUDA_R_16BF,
+                          ldc, stride_c, bs, CUDA_R_32F, CUBLAS_GEMM_DEFAULT));),
+                      DataType::kBFLOAT16)
+    default:
+        LOG_UNSUPPORTED_DTYPE(dtype, "CUDA MatmulForward");
+    }
+
     return output;
 }
 
@@ -37,12 +92,99 @@ std::tuple<std::shared_ptr<Tensor>, std::shared_ptr<Tensor>>
 MatmulBackward(const std::shared_ptr<Tensor> &input, const std::shared_ptr<Tensor> &other,
                const std::shared_ptr<Tensor> &grad_output) {
     // =================================== 作业 ===================================
-    // TODO：实现CUDA上的矩阵乘法反向传播
-    // REF:
-    // =================================== 作业 ===================================
+    /*
+       grad_input[*, m, k] = grad_output[*, m, n] * other[*, k, n]^T
+       grad_other[*, k, n] = input[*, m, k]^T * grad_output[*, m, n]
+    */
+    const auto &input_dims = input->Dims();
+    const auto &other_dims = other->Dims();
+    const auto &grad_output_dims = grad_output->Dims();
 
-    auto grad_input = std::make_shared<Tensor>();
-    auto grad_other = std::make_shared<Tensor>();
+    CHECK_GE(input_dims.size(), 2);
+    CHECK_EQ(input_dims.size(), other_dims.size());
+    CHECK_EQ(input_dims.size(), grad_output_dims.size());
+
+    const int64_t m = input_dims[input_dims.size() - 2];
+    const int64_t k = input_dims[input_dims.size() - 1];
+    const int64_t n = other_dims[other_dims.size() - 1];
+    CHECK_EQ(k, other_dims[other_dims.size() - 2]);
+    CHECK_EQ(m, grad_output_dims[grad_output_dims.size() - 2]);
+    CHECK_EQ(n, grad_output_dims[grad_output_dims.size() - 1]);
+
+    const int64_t bs = std::accumulate(input_dims.rbegin() + 2, input_dims.rend(), 1, std::multiplies<int64_t>{});
+    for (int64_t i = 0; i < input_dims.size() - 2; ++i) {
+        CHECK_EQ(input_dims[i], other_dims[i]) << "Batch dims must match";
+        CHECK_EQ(input_dims[i], grad_output_dims[i]) << "Batch dims must match";
+    }
+
+    auto dtype = input->Dtype();
+    auto grad_input = std::make_shared<Tensor>(input_dims, dtype, grad_output->GetDevice());
+    auto grad_other = std::make_shared<Tensor>(other_dims, dtype, grad_output->GetDevice());
+
+    DispatchFunc<DataType::kFLOAT32, DataType::kBFLOAT16>(
+        dtype,
+        [=]<typename T>() {
+            grad_input->Fill<T>(0);
+            grad_other->Fill<T>(0);
+        },
+        "CUDA MatmulBackward");
+
+    const auto *cuda_device = dynamic_cast<const CudaDevice *>(
+        DeviceManager::Instance()->GetDevice(DeviceType::kCUDA, input->GetDevice().Index()));
+    const float alpha = 1.0f, beta = 0.0f;
+    cublasHandle_t handle = cuda_device->CublasHandle();
+
+    {
+        // cuBLAS is colmun-major
+        // grad_input = grad_output * other.T --> grad_input.T = other * grad_output.T
+        // C = A.T * B ==> grad_input.T[*, k, m] = other[*, k, n] * grad_output.T[*, n, m]
+        // C = grad_input.T[*, k, m]
+        // A = other.T[*, n, k]
+        // B = grad_output.T[*, n, m]
+        const int lda = n, ldb = n, ldc = k;
+        const int64_t stride_a = k * n;
+        const int64_t stride_b = n * m;
+        const int64_t stride_c = m * k;
+        switch (dtype) {
+            DISPATCH_CASE(WRAP(CUBLAS_CHECK(cublasGemmStridedBatchedEx(
+                              handle, CUBLAS_OP_T, CUBLAS_OP_N, k, m, n, &alpha, other->DataPtr(), CUDA_R_32F, lda,
+                              stride_a, grad_output->DataPtr(), CUDA_R_32F, ldb, stride_b, &beta, grad_input->DataPtr(),
+                              CUDA_R_32F, ldc, stride_c, bs, CUDA_R_32F, CUBLAS_GEMM_DEFAULT));),
+                          DataType::kFLOAT32)
+            DISPATCH_CASE(
+                WRAP(CUBLAS_CHECK(cublasGemmStridedBatchedEx(
+                    handle, CUBLAS_OP_T, CUBLAS_OP_N, k, m, n, &alpha, other->DataPtr(), CUDA_R_16BF, lda, stride_a,
+                    grad_output->DataPtr(), CUDA_R_16BF, ldb, stride_b, &beta, grad_input->DataPtr(), CUDA_R_16BF, ldc,
+                    stride_c, bs, CUDA_R_32F, CUBLAS_GEMM_DEFAULT));),
+                DataType::kBFLOAT16)
+        }
+    }
+
+    {
+        // cuBLAS is colmun-major
+        // grad_other = input.T * grad_output --> grad_other.T =  grad_output.T * input
+        // C = A * B.T ==> grad_other.T[*, n, k] = grad_output.T[*, n, m] * input[*, m, k]
+        // C = grad_other.T[*, n, k]
+        // A = grad_output.T[*, n, m]
+        // B = input.T[*, k, m]
+        const int lda = n, ldb = k, ldc = n;
+        const int64_t stride_a = n * m;
+        const int64_t stride_b = k * m;
+        const int64_t stride_c = n * k;
+        switch (dtype) {
+            DISPATCH_CASE(WRAP(CUBLAS_CHECK(cublasGemmStridedBatchedEx(
+                              handle, CUBLAS_OP_N, CUBLAS_OP_T, n, k, m, &alpha, grad_output->DataPtr(), CUDA_R_32F,
+                              lda, stride_a, input->DataPtr(), CUDA_R_32F, ldb, stride_b, &beta, grad_other->DataPtr(),
+                              CUDA_R_32F, ldc, stride_c, bs, CUDA_R_32F, CUBLAS_GEMM_DEFAULT));),
+                          DataType::kFLOAT32)
+            DISPATCH_CASE(WRAP(CUBLAS_CHECK(cublasGemmStridedBatchedEx(
+                              handle, CUBLAS_OP_N, CUBLAS_OP_T, n, k, m, &alpha, grad_output->DataPtr(), CUDA_R_16BF,
+                              lda, stride_a, input->DataPtr(), CUDA_R_16BF, ldb, stride_b, &beta, grad_other->DataPtr(),
+                              CUDA_R_16BF, ldc, stride_c, bs, CUDA_R_32F, CUBLAS_GEMM_DEFAULT));),
+                          DataType::kBFLOAT16)
+        }
+    }
+
     return {grad_input, grad_other};
 }
 

@@ -8,6 +8,20 @@ include(CMakeDependentOption)
 cmake_dependent_option(BUILD_TEST_CORE "Build tests for core components" ON BUILD_TEST OFF)
 project(infini_train VERSION 0.3.0 LANGUAGES CXX)
 
+# 添加这些行
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Debug)
+endif()
+
+# 确保Debug模式包含调试信息
+set(CMAKE_CXX_FLAGS_DEBUG "-g -O0")
+set(CMAKE_C_FLAGS_DEBUG "-g -O0")
+
+# 如果使用CUDA，也为CUDA添加调试标志
+if(USE_CUDA)
+    set(CMAKE_CUDA_FLAGS_DEBUG "-g -O0")
+endif()
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -52,7 +66,18 @@ if(USE_CUDA)
     target_link_libraries(infini_train_cuda_kernels glog CUDA::cudart CUDA::cublas)
 
     add_library(infini_train STATIC ${SRC})
-    target_link_libraries(infini_train glog gflags "-Wl,--whole-archive" infini_train_cpu_kernels infini_train_cuda_kernels "-Wl,--no-whole-archive")
+    # 修改这行：添加CUDA库链接
+    target_link_libraries(infini_train 
+        glog 
+        gflags 
+        CUDA::cudart 
+        CUDA::cuda_driver  # 添加这个，解决 cuInit 等函数
+        CUDA::cublas
+        "-Wl,--whole-archive" 
+        infini_train_cpu_kernels 
+        infini_train_cuda_kernels 
+        "-Wl,--no-whole-archive"
+    )
 else()
     add_library(infini_train STATIC ${SRC})
     target_link_libraries(infini_train glog gflags "-Wl,--whole-archive" infini_train_cpu_kernels "-Wl,--no-whole-archive")

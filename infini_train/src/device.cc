@@ -2,6 +2,13 @@
 
 #include <cstdint>
 
+#ifdef USE_CUDA
+#include "infini_train/include/common/cuda/common_cuda.cuh"
+#endif
+#ifdef USE_NCCL
+#include "nccl.h"
+#include <mutex>
+#endif
 #include "glog/logging.h"
 
 namespace infini_train {
@@ -38,4 +45,95 @@ std::ostream &operator<<(std::ostream &os, const Device &device) {
     return os;
 }
 
-} // namespace infini_train
+CpuDevice::CpuDevice() : Device(DeviceType::kCPU, 0) {}
+
+#ifdef USE_CUDA
+CudaDevice::~CudaDevice() {
+    if (stream_ != nullptr) {
+        cudaStreamDestroy(stream_);
+    }
+
+    if (cublas_handle_ != nullptr) {
+        cublasDestroy(cublas_handle_);
+    }
+}
+
+void CudaDevice::SetDevice() const { cudaSetDevice(index_); }
+void CudaDevice::Synchronize() const { cudaDeviceSynchronize(); }
+
+cudaStream_t CudaDevice::Stream() const { return stream_; }
+
+cublasHandle_t CudaDevice::CublasHandle() const { return cublas_handle_; }
+
+#ifdef USE_NCCL
+ncclComm_t CudaDevice::NcclComm() const { return nccl_comm_; }
+#endif
+
+CudaDevice::CudaDevice(int8_t index) : Device(DeviceType::kCUDA, index) {
+    // TODO(dcj): make CudaDevice initialization lazy to avoid allocating memory on all GPUs in single-GPU mode
+    SetDevice();
+    cudaStreamCreate(&stream_);
+
+    cublasCreate(&cublas_handle_);
+    cublasSetStream(cublas_handle_, stream_);
+}
+#endif // USE_CUDA
+
+const DeviceManager *DeviceManager::Instance() {
+    static auto instance = std::unique_ptr<DeviceManager>(new DeviceManager());
+#ifdef USE_NCCL
+    static std::once_flag flag;
+    std::call_once(flag, [&]() { instance->InitNcclCommunicators(); });
+#endif
+    return instance.get();
+}
+
+const Device *DeviceManager::GetDevice(DeviceType type, int8_t index) const {
+    return devices_map_.at(type).at(index).get();
+}
+
+const Device *DeviceManager::GetDefaultDevice() const { return devices_map_.at(DeviceType::kCPU).at(0).get(); }
+
+std::vector<const Device *> DeviceManager::GetAllAvailableDevices(DeviceType device_type) const {
+    std::vector<const Device *> devices;
+    for (const auto &device : devices_map_.at(device_type)) { devices.push_back(device.get()); }
+    return devices;
+}
+
+DeviceManager::DeviceManager() {
+    devices_map_[DeviceType::kCPU].push_back(std::unique_ptr<CpuDevice>(new CpuDevice()));
+#ifdef USE_CUDA
+    CUDA_DRIVER_CHECK(cuInit(0));
+    int device_count = 0;
+    CUDA_DRIVER_CHECK(cuDeviceGetCount(&device_count));
+    int current_device = -1;
+    CUDA_CHECK(cudaGetDevice(&current_device));
+    for (int idx = 0; idx < device_count; ++idx) {
+        devices_map_[DeviceType::kCUDA].push_back(std::unique_ptr<CudaDevice>(new CudaDevice(idx)));
+    }
+    CUDA_CHECK(cudaSetDevice(current_device));
+#endif
+}
+
+#ifdef USE_NCCL
+void DeviceManager::InitNcclCommunicators() {
+    const auto &cuda_devices = devices_map_.at(DeviceType::kCUDA);
+    int num_devices = cuda_devices.size();
+
+    std::vector<int> device_indices;
+    std::vector<cudaStream_t> streams;
+    for (const auto &device : cuda_devices) {
+        const auto *cuda_device = dynamic_cast<const CudaDevice *>(device.get());
+        device_indices.push_back(cuda_device->Index());
+    }
+
+    std::vector<ncclComm_t> nccl_comms(num_devices, nullptr);
+    NCCL_CHECK(ncclCommInitAll(nccl_comms.data(), num_devices, device_indices.data()));
+
+    for (int i = 0; i < num_devices; ++i) {
+        auto *device = dynamic_cast<CudaDevice *>(cuda_devices[i].get());
+        device->nccl_comm_ = nccl_comms[i];
+    }
+}
+#endif
+}// namespace infini_train
