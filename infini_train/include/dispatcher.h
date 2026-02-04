@@ -2,6 +2,10 @@
 
 #include <iostream>
 #include <map>
+#include <string>
+#define REGISTER_KERNEL_CONCAT_IMPL(a, b) a##b
+#define REGISTER_KERNEL_CONCAT(a, b) REGISTER_KERNEL_CONCAT_IMPL(a, b)
+
 #include <type_traits>
 #include <utility>
 
@@ -17,11 +21,13 @@ public:
     template <typename RetT, class... ArgsT> RetT Call(ArgsT... args) const {
         // =================================== 作业 ===================================
         // TODO：实现通用kernel调用接口
-        // 功能描述：将存储的函数指针转换为指定类型并调用
+        // 功能描述：将存储的函数指针转换为x指定类型并调用
         // =================================== 作业 ===================================
 
         using FuncT = RetT (*)(ArgsT...);
-        // TODO: 实现函数调用逻辑
+        auto f = reinterpret_cast<FuncT>(func_ptr_);
+        CHECK(f != nullptr) << "Attempt to call null kernel function";
+        return f(args...);
     }
 
 private:
@@ -48,6 +54,9 @@ public:
         // TODO：实现kernel注册机制
         // 功能描述：将kernel函数与设备类型、名称绑定
         // =================================== 作业 ===================================
+        CHECK(!key_to_kernel_map_.contains(key))
+            << "Kernel already registered: " << key.second << " on device: " << static_cast<int>(key.first);
+        key_to_kernel_map_.emplace(key, KernelFunction(std::forward<FuncT>(kernel)));
     }
 
 private:
@@ -55,8 +64,7 @@ private:
 };
 } // namespace infini_train
 
-#define REGISTER_KERNEL(device, kernel_name, kernel_func)                                                              \
-    // =================================== 作业 ===================================
-    // TODO：实现自动注册宏
-    // 功能描述：在全局静态区注册kernel，避免显式初始化代码
-    // =================================== 作业 ===================================
+#define REGISTER_KERNEL(device, kernel_name, kernel_func)                                \
+    static const int REGISTER_KERNEL_CONCAT(_reg_##kernel_name##_, __LINE__) =          \
+        ((void)::infini_train::Dispatcher::Instance().Register(                          \
+             ::infini_train::Dispatcher::KeyT(device, #kernel_name), kernel_func), 0);

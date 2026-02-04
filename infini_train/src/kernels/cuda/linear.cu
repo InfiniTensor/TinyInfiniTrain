@@ -28,8 +28,59 @@ std::shared_ptr<Tensor> MatmulForward(const std::shared_ptr<Tensor> &input, cons
     // TODO：实现CUDA上的矩阵乘法前向计算
     // REF:
     // =================================== 作业 ===================================
+    const auto &input_dims = input->Dims();
+    const auto &other_dims = other->Dims();
+    
+    const int64_t m = input_dims[input_dims.size() - 2];
+    const int64_t k = input_dims[input_dims.size() - 1];
+    const int64_t n = other_dims[other_dims.size() - 1];
 
-    auto output = std::make_shared<Tensor>();
+    int64_t batch_count = 1;
+    std::vector<int64_t> leading_dims;
+    if (input_dims.size() > 2) {
+        leading_dims.assign(input_dims.begin(), input_dims.end() - 2);
+        for (auto d : leading_dims) batch_count *= d;
+    }
+
+    std::vector<int64_t> output_dims;
+    if (!leading_dims.empty()) {
+        output_dims = leading_dims;
+    }
+    output_dims.push_back(m);
+    output_dims.push_back(n);
+    auto output = std::make_shared<Tensor>(output_dims, DataType::kFLOAT32, input->GetDevice());
+
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+
+    cublasHandle_t handle;
+    CUBLAS_CHECK(cublasCreate(&handle));
+
+    // if no batch, do single sgemm; otherwise do per-batch sgemm
+    if (batch_count == 1) {
+        CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, n, m, k, &alpha,
+                                static_cast<const float *>(other->DataPtr()), n,
+                                static_cast<const float *>(input->DataPtr()), k, &beta,
+                                static_cast<float *>(output->DataPtr()), n));
+    } else {
+        // assume contiguous layout: batch-major then row-major for each matrix as used elsewhere
+        // input slice size = m * k, other slice size = k * n, output slice size = m * n
+        const int64_t in_stride = m * k;
+        const int64_t other_stride = k * n;
+        const int64_t out_stride = m * n;
+        const float *in_base = static_cast<const float *>(input->DataPtr());
+        const float *other_base = static_cast<const float *>(other->DataPtr());
+        float *out_base = static_cast<float *>(output->DataPtr());
+        for (int64_t b = 0; b < batch_count; ++b) {
+            const float *in_ptr = in_base + b * in_stride;
+            const float *other_ptr = other_base + b * other_stride;
+            float *out_ptr = out_base + b * out_stride;
+            CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, n, m, k, &alpha,
+                                    other_ptr, n, in_ptr, k, &beta, out_ptr, n));
+        }
+    }
+
+    CUBLAS_CHECK(cublasDestroy(handle));
     return output;
 }
 
@@ -40,9 +91,34 @@ MatmulBackward(const std::shared_ptr<Tensor> &input, const std::shared_ptr<Tenso
     // TODO：实现CUDA上的矩阵乘法反向传播
     // REF:
     // =================================== 作业 ===================================
+    const auto &a_dims = input->Dims();
+    const auto &b_dims = other->Dims();
+    
+    const int64_t m = a_dims[0];
+    const int64_t k = a_dims[1];
+    const int64_t n = b_dims[1];
+    
+    const auto grad_input = std::make_shared<Tensor>(a_dims,DataType::kFLOAT32,grad_output->GetDevice());
+    const auto grad_other = std::make_shared<Tensor>(b_dims,DataType::kFLOAT32,grad_output->GetDevice());
+    
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    
+    cublasHandle_t handle;
+    CUBLAS_CHECK(cublasCreate(&handle));
+    CUBLAS_CHECK(cublasSgemm(handle,CUBLAS_OP_T,CUBLAS_OP_N,k,m,n,&alpha,
+                static_cast<const float *>(other->DataPtr()),n,
+                static_cast<const float *>(grad_output->DataPtr()),n,
+                &beta,
+                static_cast<float *>(grad_input->DataPtr()),k));
 
-    auto grad_input = std::make_shared<Tensor>();
-    auto grad_other = std::make_shared<Tensor>();
+    CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T, n, k, m, &alpha,
+                static_cast<const float *>(grad_output->DataPtr()), n,
+                static_cast<const float *>(input->DataPtr()), k,
+                &beta,
+                static_cast<float *>(grad_other->DataPtr()), n));
+
+    CUBLAS_CHECK(cublasDestroy(handle));
     return {grad_input, grad_other};
 }
 
@@ -225,9 +301,7 @@ LinearBackward(const std::shared_ptr<Tensor> &input, const std::shared_ptr<Tenso
             <<<num_blocks, threads_per_block>>>(static_cast<const float *>(grad_output->DataPtr()),
                                                 static_cast<float *>(grad_bias->DataPtr()), out_features, bs);
     }
-
     CUBLAS_CHECK(cublasDestroy(handle));
-
     return {grad_input, grad_weight, grad_bias};
 }
 } // namespace infini_train::kernels::cuda

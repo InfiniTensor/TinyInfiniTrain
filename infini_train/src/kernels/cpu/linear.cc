@@ -15,9 +15,51 @@ std::shared_ptr<Tensor> MatmulForward(const std::shared_ptr<Tensor> &input, cons
     // TODO：实现CPU上的矩阵乘法前向计算
     // REF:
     // =================================== 作业 ===================================
+    const auto &a_dims = input->Dims();
+    const auto &b_dims = other->Dims();
 
-    auto output = std::make_shared<Tensor>();
-    return {output};
+    CHECK_GE(a_dims.size(), 2);
+    CHECK_GE(b_dims.size(), 2);
+
+    const int64_t m = a_dims[a_dims.size() - 2];
+    const int64_t k = a_dims[a_dims.size() - 1];
+    const int64_t n = b_dims[b_dims.size() - 1];
+
+    std::vector<int64_t> batch_dims(a_dims.begin(), a_dims.end() - 2);
+    std::vector<int64_t> b_batch_dims(b_dims.begin(), b_dims.end() - 2);
+    CHECK_EQ(batch_dims.size(), b_batch_dims.size());
+    for (size_t i = 0; i < batch_dims.size(); ++i) CHECK_EQ(batch_dims[i], b_batch_dims[i]);
+    std::vector<int64_t> out_dims = batch_dims;
+    out_dims.push_back(m);
+    out_dims.push_back(n);
+    auto output = std::make_shared<Tensor>(out_dims, DataType::kFLOAT32);
+    int64_t batch_count = 1;
+    for (auto d : batch_dims) batch_count *= d;
+
+    const float *a_ptr = static_cast<const float *>(input->DataPtr());
+    const float *b_ptr = static_cast<const float *>(other->DataPtr());
+    float *out_ptr = static_cast<float *>(output->DataPtr());
+
+    const int64_t a_block = m * k;
+    const int64_t b_block = k * n;
+    const int64_t out_block = m * n;
+
+    for (int64_t batch = 0; batch < batch_count; ++batch) {
+        const float *a_block_ptr = a_ptr + batch * a_block;
+        const float *b_block_ptr = b_ptr + batch * b_block;
+        float *out_block_ptr = out_ptr + batch * out_block;
+
+        Eigen::Map<const Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> A(
+            reinterpret_cast<const float *>(a_block_ptr), m, k);
+        Eigen::Map<const Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> B(
+            reinterpret_cast<const float *>(b_block_ptr), k, n);
+        Eigen::Map<Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> C(
+            reinterpret_cast<float *>(out_block_ptr), m, n);
+
+        C.noalias() = A * B;
+    }
+
+    return output;
 }
 
 std::tuple<std::shared_ptr<Tensor>, std::shared_ptr<Tensor>>
@@ -27,9 +69,60 @@ MatmulBackward(const std::shared_ptr<Tensor> &input, const std::shared_ptr<Tenso
     // TODO：实现CPU上的矩阵乘法反向传播
     // REF:
     // =================================== 作业 ===================================
+    const auto &a_dims = input->Dims();
+    const auto &b_dims = other->Dims();
 
-    auto grad_input = std::make_shared<Tensor>();
-    auto grad_other = std::make_shared<Tensor>();
+    CHECK_GE(a_dims.size(), 2);
+    CHECK_GE(b_dims.size(), 2);
+
+    const int64_t m = a_dims[a_dims.size() - 2];
+    const int64_t k = a_dims[a_dims.size() - 1];
+    const int64_t n = b_dims[b_dims.size() - 1];
+
+    std::vector<int64_t> batch_dims(a_dims.begin(), a_dims.end() - 2);
+    std::vector<int64_t> b_batch_dims(b_dims.begin(), b_dims.end() - 2);
+    CHECK_EQ(batch_dims.size(), b_batch_dims.size());
+    for (size_t i = 0; i < batch_dims.size(); ++i) CHECK_EQ(batch_dims[i], b_batch_dims[i]);
+
+    auto grad_input = std::make_shared<Tensor>(a_dims, DataType::kFLOAT32);
+    auto grad_other = std::make_shared<Tensor>(b_dims, DataType::kFLOAT32);
+
+    int64_t batch_count = 1;
+    for (auto d : batch_dims) batch_count *= d;
+
+    const float *a_ptr = static_cast<const float *>(input->DataPtr());
+    const float *b_ptr = static_cast<const float *>(other->DataPtr());
+    const float *g_ptr = static_cast<const float *>(grad_output->DataPtr());
+    float *gi_ptr = static_cast<float *>(grad_input->DataPtr());
+    float *go_ptr = static_cast<float *>(grad_other->DataPtr());
+
+    const int64_t a_block = m * k;
+    const int64_t b_block = k * n;
+    const int64_t g_block = m * n;
+
+    for (int64_t batch = 0; batch < batch_count; ++batch) {
+        const float *a_block_ptr = a_ptr + batch * a_block;
+        const float *b_block_ptr = b_ptr + batch * b_block;
+        const float *g_block_ptr = g_ptr + batch * g_block;
+        float *gi_block_ptr = gi_ptr + batch * a_block;
+        float *go_block_ptr = go_ptr + batch * b_block;
+
+        Eigen::Map<const Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> A(
+            reinterpret_cast<const float *>(a_block_ptr), m, k);
+        Eigen::Map<const Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> B(
+            reinterpret_cast<const float *>(b_block_ptr), k, n);
+        Eigen::Map<const Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> G(
+            reinterpret_cast<const float *>(g_block_ptr), m, n);
+
+        Eigen::Map<Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> GI(
+            reinterpret_cast<float *>(gi_block_ptr), m, k);
+        Eigen::Map<Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> GO(
+            reinterpret_cast<float *>(go_block_ptr), k, n);
+
+        GI.noalias() = G * B.transpose();
+        GO.noalias() = A.transpose() * G;
+    }
+
     return {grad_input, grad_other};
 }
 

@@ -65,6 +65,8 @@ private:
     void *data_ = nullptr;
 };
 
+
+//Tensor的定义
 class Tensor : public std::enable_shared_from_this<Tensor> {
 public:
     Tensor() = default;

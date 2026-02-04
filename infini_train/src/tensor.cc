@@ -282,8 +282,26 @@ std::shared_ptr<Tensor> Tensor::Flatten(int64_t start, int64_t end) {
     // TODO：实现张量扁平化操作，将指定维度范围[start, end]内的所有维度合并为一个维度
     // HINT:
     // =================================== 作业 ===================================
+    std::vector<int64_t> new_shape = dims_;
 
-    return std::make_shared<Tensor>();
+    const int64_t rank = static_cast<int64_t>(new_shape.size());
+    if (start < 0) start += rank;
+    if (end < 0) end += rank;
+    CHECK_GE(start, 0);
+    CHECK_LT(start, rank);
+    CHECK_GE(end, 0);
+    CHECK_LT(end, rank);
+    CHECK_GE(end, start);
+
+    int64_t new_size = 1;
+    for (int64_t i = start; i <= end; ++i) {
+        new_size *= new_shape[i];
+    }
+
+    new_shape.erase(new_shape.begin() + start, new_shape.begin() + end + 1);
+    new_shape.insert(new_shape.begin() + start, new_size);
+
+    return Contiguous()->View(new_shape);
 }
 
 std::shared_ptr<Tensor> Tensor::Squeeze(int64_t dim) {
@@ -358,6 +376,35 @@ void Tensor::Backward(std::shared_ptr<Tensor> gradient, bool retain_graph, bool 
     // TODO：实现自动微分反向传播
     // 功能描述：1. 计算当前张量对叶子节点的梯度    2. 支持多输出场景的梯度累加
     // =================================== 作业 ===================================
+    std::shared_ptr<Tensor> grad = gradient;
+    if (!grad) {
+        //传入的loss必须是一个标量
+        if (NumElements() != 1) {
+            LOG(FATAL) << "grad must be specified for non-scalar tensor";
+        }
+        grad = std::make_shared<Tensor>(dims_, dtype_, GetDevice());
+        grad->Fill<float>(1.0f);
+    }
+
+    if (grad->GetDevice().Type() != GetDevice().Type()) {
+        grad = std::make_shared<Tensor>(grad->To(GetDevice()));
+    }
+
+    CHECK_EQ(grad->NumElements(), NumElements()) << "gradient must have the same number of elements as tensor";
+
+    if (is_leaf()) {
+        if (!grad_) {
+            auto self = const_cast<Tensor *>(this);
+            self->grad_ = std::make_shared<Tensor>(dims_, dtype_, GetDevice());
+            self->grad_->Fill<float>(0.0f);
+        }
+        auto kernel = Dispatcher::Instance().GetKernel({GetDevice().Type(), "AccumulateGrad"});
+        kernel.Call<void>(grad, 1.0f, grad_);
+        return;
+    }
+    if (grad_fn_) {
+        grad_fn_->BackwardPartial(grad, output_idx_);
+    }
 }
 
 void Tensor::ZeroGrad() {

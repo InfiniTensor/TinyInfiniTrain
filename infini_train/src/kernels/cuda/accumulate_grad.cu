@@ -22,6 +22,20 @@ void AccumulateGrad(const std::shared_ptr<Tensor> &gradient, float rate, const s
     AccumulateGradKernel<<<num_blocks, threads_per_block>>>(grad_ptr, rate, tensor_ptr, num_elements);
 }
 
+__global__ void AdamAccumulateGradKernel(const float *grad_ptr,float *p_ptr,float *m_ptr,float *v_ptr,float learning_rate,
+                                         float bias_correction1, float bias_correction2,float eps, int64_t t,size_t n,float beta1,float beta2){
+                                            int idx = blockDim.x * blockIdx.x + threadIdx.x;
+                                            if(idx < n)
+                                            {
+                                                m_ptr[idx] = beta1 * m_ptr[idx] + (1 - beta1) * grad_ptr[idx];
+                                                v_ptr[idx] = beta2 * v_ptr[idx] + (1 - beta2) * grad_ptr[idx] * grad_ptr[idx];
+                                                float m_hat = m_ptr[idx] / bias_correction1;
+                                                float v_hat = v_ptr[idx] / bias_correction2;
+                                                p_ptr[idx] -= learning_rate * m_hat / (sqrtf(v_hat) + eps);
+                                            }
+                                            }
+
+// keep function inside namespace so `Tensor` (in namespace infini_train) is found unqualified
 void AdamAccumulateGrad(const std::shared_ptr<Tensor> &grad, const std::shared_ptr<Tensor> &param,
                         const std::shared_ptr<Tensor> &m, const std::shared_ptr<Tensor> &v, float learning_rate,
                         float beta1, float beta2, float eps, int64_t t) {
@@ -29,7 +43,19 @@ void AdamAccumulateGrad(const std::shared_ptr<Tensor> &grad, const std::shared_p
     // TODO：实现Adam优化器的梯度累积和参数更新
     // REF:
     // =================================== 作业 ===================================
+    const auto n = grad->NumElements();
+    const float *grad_ptr = static_cast<const float *>(grad->DataPtr());
+    float *p_ptr = static_cast<float *>(param->DataPtr());
+    float *m_ptr = static_cast<float *>(m->DataPtr());
+    float *v_ptr = static_cast<float *>(v->DataPtr());
+    int threads_per_block = 256;
+    int num_blocks = (n + threads_per_block - 1) / threads_per_block;
+    float bias_correction1 = 1.0f - powf(beta1, t);
+    float bias_correction2 = 1.0f - powf(beta2, t);
+    AdamAccumulateGradKernel<<<num_blocks,threads_per_block>>>(grad_ptr,p_ptr,m_ptr,v_ptr,learning_rate,bias_correction1,bias_correction2,eps,t,n,beta1,beta2);
+
 }
+
 } // namespace infini_train::kernels::cuda
 
 #define REGISTER_CUDA_ACCUMULATE_GRAD_KERNEL(kernel_name)                                                              \
