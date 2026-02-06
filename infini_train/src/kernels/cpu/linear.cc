@@ -3,6 +3,7 @@
 #include <memory>
 #include <numeric>
 #include <tuple>
+#include <vector>
 
 #include "glog/logging.h"
 
@@ -10,14 +11,78 @@
 #include "infini_train/include/tensor.h"
 
 namespace infini_train::kernels::cpu {
+namespace {
+struct MatmulMeta {
+    int64_t batch = 1;
+    int64_t m = 0;
+    int64_t k = 0;
+    int64_t n = 0;
+    std::vector<int64_t> output_dims;
+};
+
+MatmulMeta BuildMatmulMeta(const std::shared_ptr<Tensor> &input, const std::shared_ptr<Tensor> &other) {
+    CHECK_EQ(static_cast<int>(input->Dtype()), static_cast<int>(DataType::kFLOAT32));
+    CHECK_EQ(static_cast<int>(other->Dtype()), static_cast<int>(DataType::kFLOAT32));
+    CHECK_EQ(static_cast<int>(input->GetDevice().Type()), static_cast<int>(other->GetDevice().Type()));
+
+    const auto &input_dims = input->Dims();
+    const auto &other_dims = other->Dims();
+    CHECK_GE(input_dims.size(), 2);
+    CHECK_EQ(input_dims.size(), other_dims.size());
+
+    const int64_t ndim = input_dims.size();
+    for (int64_t i = 0; i < ndim - 2; ++i) {
+        // 当前作业场景下，批次维必须逐维一致（不做广播）。
+        CHECK_EQ(input_dims[i], other_dims[i]);
+    }
+
+    const int64_t m = input_dims[ndim - 2];
+    const int64_t k = input_dims[ndim - 1];
+    const int64_t other_k = other_dims[ndim - 2];
+    const int64_t n = other_dims[ndim - 1];
+    CHECK_EQ(k, other_k);
+
+    MatmulMeta meta;
+    meta.batch = std::accumulate(input_dims.begin(), input_dims.end() - 2, int64_t{1}, std::multiplies<int64_t>{});
+    meta.m = m;
+    meta.k = k;
+    meta.n = n;
+    meta.output_dims = input_dims;
+    meta.output_dims[ndim - 1] = n;
+    return meta;
+}
+} // namespace
+
 std::shared_ptr<Tensor> MatmulForward(const std::shared_ptr<Tensor> &input, const std::shared_ptr<Tensor> &other) {
     // =================================== 作业 ===================================
     // TODO：实现CPU上的矩阵乘法前向计算
     // REF:
     // =================================== 作业 ===================================
+    const auto meta = BuildMatmulMeta(input, other);
+    auto output = std::make_shared<Tensor>(meta.output_dims, DataType::kFLOAT32, input->GetDevice());
 
-    auto output = std::make_shared<Tensor>();
-    return {output};
+    const float *input_ptr = static_cast<const float *>(input->DataPtr());
+    const float *other_ptr = static_cast<const float *>(other->DataPtr());
+    float *output_ptr = static_cast<float *>(output->DataPtr());
+
+    // 以 batch 为粒度并行，单个 batch 内使用 Eigen GEMM，兼顾可读性与性能。
+#pragma omp parallel for if (meta.batch > 1)
+    for (int64_t batch_idx = 0; batch_idx < meta.batch; ++batch_idx) {
+        const float *input_batch_ptr = input_ptr + batch_idx * meta.m * meta.k;
+        const float *other_batch_ptr = other_ptr + batch_idx * meta.k * meta.n;
+        float *output_batch_ptr = output_ptr + batch_idx * meta.m * meta.n;
+
+        Eigen::Map<const Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> input_matrix(
+            input_batch_ptr, meta.m, meta.k);
+        Eigen::Map<const Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> other_matrix(
+            other_batch_ptr, meta.k, meta.n);
+        Eigen::Map<Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> output_matrix(
+            output_batch_ptr, meta.m, meta.n);
+
+        output_matrix.noalias() = input_matrix * other_matrix;
+    }
+
+    return output;
 }
 
 std::tuple<std::shared_ptr<Tensor>, std::shared_ptr<Tensor>>
@@ -27,9 +92,48 @@ MatmulBackward(const std::shared_ptr<Tensor> &input, const std::shared_ptr<Tenso
     // TODO：实现CPU上的矩阵乘法反向传播
     // REF:
     // =================================== 作业 ===================================
+    const auto meta = BuildMatmulMeta(input, other);
+    const auto &grad_output_dims = grad_output->Dims();
+    CHECK_EQ(grad_output_dims.size(), meta.output_dims.size());
+    for (size_t dim_idx = 0; dim_idx < grad_output_dims.size(); ++dim_idx) {
+        CHECK_EQ(grad_output_dims[dim_idx], meta.output_dims[dim_idx]);
+    }
+    CHECK_EQ(static_cast<int>(grad_output->Dtype()), static_cast<int>(DataType::kFLOAT32));
 
-    auto grad_input = std::make_shared<Tensor>();
-    auto grad_other = std::make_shared<Tensor>();
+    auto grad_input = std::make_shared<Tensor>(input->Dims(), DataType::kFLOAT32, input->GetDevice());
+    auto grad_other = std::make_shared<Tensor>(other->Dims(), DataType::kFLOAT32, other->GetDevice());
+
+    const float *input_ptr = static_cast<const float *>(input->DataPtr());
+    const float *other_ptr = static_cast<const float *>(other->DataPtr());
+    const float *grad_output_ptr = static_cast<const float *>(grad_output->DataPtr());
+    float *grad_input_ptr = static_cast<float *>(grad_input->DataPtr());
+    float *grad_other_ptr = static_cast<float *>(grad_other->DataPtr());
+
+    // dInput = dOut * Other^T，dOther = Input^T * dOut。
+#pragma omp parallel for if (meta.batch > 1)
+    for (int64_t batch_idx = 0; batch_idx < meta.batch; ++batch_idx) {
+        const float *input_batch_ptr = input_ptr + batch_idx * meta.m * meta.k;
+        const float *other_batch_ptr = other_ptr + batch_idx * meta.k * meta.n;
+        const float *grad_output_batch_ptr = grad_output_ptr + batch_idx * meta.m * meta.n;
+        float *grad_input_batch_ptr = grad_input_ptr + batch_idx * meta.m * meta.k;
+        float *grad_other_batch_ptr = grad_other_ptr + batch_idx * meta.k * meta.n;
+
+        Eigen::Map<const Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> input_matrix(
+            input_batch_ptr, meta.m, meta.k);
+        Eigen::Map<const Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> other_matrix(
+            other_batch_ptr, meta.k, meta.n);
+        Eigen::Map<const Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> grad_output_matrix(
+            grad_output_batch_ptr, meta.m, meta.n);
+
+        Eigen::Map<Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> grad_input_matrix(
+            grad_input_batch_ptr, meta.m, meta.k);
+        Eigen::Map<Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> grad_other_matrix(
+            grad_other_batch_ptr, meta.k, meta.n);
+
+        grad_input_matrix.noalias() = grad_output_matrix * other_matrix.transpose();
+        grad_other_matrix.noalias() = input_matrix.transpose() * grad_output_matrix;
+    }
+
     return {grad_input, grad_other};
 }
 

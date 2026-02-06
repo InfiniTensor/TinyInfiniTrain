@@ -1,2 +1,35 @@
 CompileFlags:
-  CompilationDatabase: build/Release
+  CompilationDatabase: build/Clangd
+  Remove: [-fopenmp]
+
+Diagnostics:
+  Suppress:
+    # clangd14 + 系统头组合下偶发的噪音诊断，不影响项目代码
+    - builtin_definition
+
+---
+If:
+  PathMatch: .*\.cu$
+CompileFlags:
+  # .cu 走 clangd 解析时，改用 clang++ 驱动并移除 nvcc 专属参数
+  Compiler: /bin/clang++-14
+  Remove:
+    - --expt-extended-lambda
+    - --expt-relaxed-constexpr
+    - --generate-code=*
+    - -std=*
+  Add:
+    - -std=c++17
+    - --cuda-gpu-arch=sm_70
+    - --cuda-path=/usr/local/cuda
+    - --no-cuda-version-check
+
+---
+If:
+  PathMatch: (^|/)third_party/eigen/bench/.*
+Index:
+  # bench 目录不是本项目业务代码，跳过可减少误报和索引干扰
+  Background: Skip
+Diagnostics:
+  Suppress:
+    - '*'
