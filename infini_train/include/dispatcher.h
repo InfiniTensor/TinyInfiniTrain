@@ -34,16 +34,9 @@ class Dispatcher {
 public:
     using KeyT = std::pair<DeviceType, std::string>;
 
-    static Dispatcher &Instance() {
-        static Dispatcher instance;
-        return instance;
-    }
+    static Dispatcher &Instance();
 
-    const KernelFunction &GetKernel(KeyT key) const {
-        CHECK(key_to_kernel_map_.contains(key))
-            << "Kernel not found: " << key.second << " on device: " << static_cast<int>(key.first);
-        return key_to_kernel_map_.at(key);
-    }
+    const KernelFunction &GetKernel(KeyT key) const;
 
     template <typename FuncT> void Register(const KeyT &key, FuncT &&kernel) {
         // =================================== 作业 ===================================
@@ -51,7 +44,7 @@ public:
         // 功能描述：将kernel函数与设备类型、名称绑定
         // =================================== 作业 ===================================
         // 重复注册直接报错，避免同一 key 被覆盖导致行为不确定。
-        CHECK(!key_to_kernel_map_.contains(key))
+        CHECK(key_to_kernel_map_.find(key) == key_to_kernel_map_.end())
             << "Kernel already registered: " << key.second << " on device: " << static_cast<int>(key.first);
         key_to_kernel_map_.emplace(key, KernelFunction(std::forward<FuncT>(kernel)));
     }
