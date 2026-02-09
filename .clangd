@@ -20,6 +20,8 @@ CompileFlags:
     - -std=*
   Add:
     - -std=c++17
+    - -I/usr/local/cuda/include
+    - -I/usr/local/cuda/targets/x86_64-linux/include
     - --cuda-gpu-arch=sm_70
     - --cuda-path=/usr/local/cuda
     - --no-cuda-version-check
@@ -29,6 +31,16 @@ If:
   PathMatch: (^|/)third_party/eigen/bench/.*
 Index:
   # bench 目录不是本项目业务代码，跳过可减少误报和索引干扰
+  Background: Skip
+Diagnostics:
+  Suppress:
+    - '*'
+
+---
+If:
+  # 系统头/外部 CUDA 头不是项目源码，打开头文件本身时常出现误报
+  PathMatch: (^/usr/include/.*)|(^/usr/local/cuda/include/.*)|(^/usr/local/cuda/targets/.*/include/.*)|(^/usr/local/cuda-[^/]+/include/.*)|(^/usr/local/cuda-[^/]+/targets/.*/include/.*)
+Index:
   Background: Skip
 Diagnostics:
   Suppress:
