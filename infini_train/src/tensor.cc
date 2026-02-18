@@ -4,6 +4,7 @@
 #include <cstring>
 #include <fstream>
 #include <functional>
+#include <iomanip>
 #include <memory>
 #include <numeric>
 #include <unordered_map>
@@ -282,8 +283,41 @@ std::shared_ptr<Tensor> Tensor::Flatten(int64_t start, int64_t end) {
     // TODO：实现张量扁平化操作，将指定维度范围[start, end]内的所有维度合并为一个维度
     // HINT:
     // =================================== 作业 ===================================
+    const int64_t ndim = static_cast<int64_t>(dims_.size());
+    CHECK_GT(ndim, 0) << "Flatten expects tensor with at least one dimension";
 
-    return std::make_shared<Tensor>();
+    if (start < 0) {
+        start += ndim;
+    }
+    if (end < 0) {
+        end += ndim;
+    }
+
+    CHECK_GE(start, 0);
+    CHECK_LT(start, ndim);
+    CHECK_GE(end, 0);
+    CHECK_LT(end, ndim);
+    CHECK_LE(start, end);
+
+    std::vector<int64_t> new_shape;
+    new_shape.reserve(static_cast<size_t>(ndim - (end - start)));
+
+    for (int64_t idx = 0; idx < start; ++idx) {
+        new_shape.push_back(dims_[idx]);
+    }
+
+    int64_t merged_dim = 1;
+    for (int64_t idx = start; idx <= end; ++idx) {
+        merged_dim *= dims_[idx];
+    }
+    new_shape.push_back(merged_dim);
+
+    for (int64_t idx = end + 1; idx < ndim; ++idx) {
+        new_shape.push_back(dims_[idx]);
+    }
+
+    // 先保证连续内存，再通过 View 改变形状。
+    return Contiguous()->View(new_shape);
 }
 
 std::shared_ptr<Tensor> Tensor::Squeeze(int64_t dim) {
@@ -358,6 +392,33 @@ void Tensor::Backward(std::shared_ptr<Tensor> gradient, bool retain_graph, bool 
     // TODO：实现自动微分反向传播
     // 功能描述：1. 计算当前张量对叶子节点的梯度    2. 支持多输出场景的梯度累加
     // =================================== 作业 ===================================
+    (void)retain_graph;
+    (void)create_graph;
+
+    if (!requires_grad_) {
+        return;
+    }
+
+    if (!gradient) {
+        CHECK_EQ(NumElements(), 1) << "Gradient can be implicitly created only for scalar output";
+        gradient = std::make_shared<Tensor>(dims_, dtype_, GetDevice());
+        gradient->Fill<float>(1.0f);
+    } else {
+        CHECK_EQ(gradient->NumElements(), NumElements());
+        CHECK_EQ(static_cast<int>(gradient->Dtype()), static_cast<int>(dtype_));
+        CHECK_EQ(static_cast<int>(gradient->GetDevice().Type()), static_cast<int>(GetDevice().Type()));
+    }
+
+    if (is_leaf_) {
+        CHECK(grad_) << "Leaf tensor requires grad buffer, call RequiresGrad() first";
+        auto kernel = Dispatcher::Instance().GetKernel({GetDevice().Type(), "AccumulateGrad"});
+        kernel.Call<void>(gradient, 1.0f, grad_);
+        return;
+    }
+
+    if (grad_fn_) {
+        grad_fn_->BackwardPartial(gradient, output_idx_);
+    }
 }
 
 void Tensor::ZeroGrad() {

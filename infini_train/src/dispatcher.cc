@@ -2,6 +2,18 @@
 
 namespace infini_train {
 
+Dispatcher &Dispatcher::Instance() {
+    static Dispatcher instance;
+    return instance;
+}
+
+const KernelFunction &Dispatcher::GetKernel(KeyT key) const {
+    auto iter = key_to_kernel_map_.find(key);
+    CHECK(iter != key_to_kernel_map_.end())
+        << "Kernel not found: " << key.second << " on device: " << static_cast<int>(key.first);
+    return iter->second;
+}
+
 // Dispatcher &Dispatcher::Instance() {
 //     static Dispatcher instance;
 //     return instance;
