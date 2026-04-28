@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -53,23 +54,52 @@ template <typename T> T BytesToType(const std::vector<uint8_t> &bytes, size_t of
 }
 
 TinyShakespeareFile ReadTinyShakespeareFile(const std::string &path, size_t sequence_length) {
-    /* =================================== 作业 ===================================
-       TODO：实现二进制数据集文件解析
-       文件格式说明：
-    ----------------------------------------------------------------------------------
-    | HEADER (1024 bytes)                     | DATA (tokens)                        |
-    | magic(4B) | version(4B) | num_toks(4B) | reserved(1012B) | token数据           |
-    ----------------------------------------------------------------------------------
-       =================================== 作业 =================================== */
+    std::ifstream ifs(path, std::ios::binary);
+    CHECK(ifs.is_open()) << "Failed to open dataset file: " << path;
+
+    // Read 1024-byte header
+    auto header = ReadSeveralBytesFromIfstream(1024, &ifs);
+    const uint32_t magic = BytesToType<uint32_t>(header, 0);
+    // version at offset 4 (unused here)
+    const uint32_t num_tokens = BytesToType<uint32_t>(header, 8);
+
+    CHECK(kTypeMap.contains(magic)) << "Unknown dataset magic: " << magic;
+    const TinyShakespeareType type = kTypeMap.at(magic);
+    const size_t token_bytes = kTypeToSize.at(type);
+
+    // Read raw token data and convert to int64
+    std::vector<int64_t> tokens(num_tokens);
+    for (uint32_t i = 0; i < num_tokens; ++i) {
+        auto raw = ReadSeveralBytesFromIfstream(token_bytes, &ifs);
+        if (type == TinyShakespeareType::kUINT16) {
+            tokens[i] = static_cast<int64_t>(BytesToType<uint16_t>(raw, 0));
+        } else {
+            tokens[i] = static_cast<int64_t>(BytesToType<uint32_t>(raw, 0));
+        }
+    }
+
+    const size_t num_windows = num_tokens / sequence_length;
+    CHECK_GT(num_windows, 1) << "Not enough tokens for even one sample";
+
+    // Build flat int64 tensor of shape [num_windows * sequence_length]
+    // Tensor constructor takes dims; store flat then let operator[] slice
+    const std::vector<int64_t> flat_dims = {static_cast<int64_t>(num_windows * sequence_length)};
+    infini_train::Tensor tensor(flat_dims, infini_train::DataType::kINT64);
+    std::memcpy(tensor.DataPtr(), tokens.data(), num_tokens * sizeof(int64_t));
+
+    TinyShakespeareFile result;
+    result.type = type;
+    result.dims = {static_cast<int64_t>(num_windows), static_cast<int64_t>(sequence_length)};
+    result.tensor = std::move(tensor);
+    return result;
 }
 } // namespace
 
-TinyShakespeareDataset::TinyShakespeareDataset(const std::string &filepath, size_t sequence_length) {
-    // =================================== 作业 ===================================
-    // TODO：初始化数据集实例
-    // HINT: 调用ReadTinyShakespeareFile加载数据文件
-    // =================================== 作业 ===================================
-}
+TinyShakespeareDataset::TinyShakespeareDataset(const std::string &filepath, size_t sequence_length)
+    : text_file_(ReadTinyShakespeareFile(filepath, sequence_length)),
+      sequence_length_(sequence_length),
+      sequence_size_in_bytes_(sequence_length * sizeof(int64_t)),
+      num_samples_(static_cast<size_t>(text_file_.dims[0]) - 1) {}
 
 std::pair<std::shared_ptr<infini_train::Tensor>, std::shared_ptr<infini_train::Tensor>>
 TinyShakespeareDataset::operator[](size_t idx) const {

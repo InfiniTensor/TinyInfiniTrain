@@ -1,6 +1,8 @@
 #include "example/common/tokenizer.h"
 
+#include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -69,23 +71,30 @@ int SampleMult(float *probabilities, int n, float coin) {
 }
 
 Tokenizer::Tokenizer(const std::string &filepath) {
-    /* ===================================== 作业 =====================================
-    TODO：实现Tokenizer二进制文件加载
+    std::ifstream ifs(filepath, std::ios::binary);
+    CHECK(ifs.is_open()) << "Failed to open tokenizer file: " << filepath;
 
-    文件格式说明：
-    ----------------------------------------------------------------------------------
-    | HEADER (1024 bytes)                     | VOCAB TABLE                           |
-    | magic(4B) | version(4B) | vocab_size(4B) | reserved(1012B) | token词表数据       |
-    ----------------------------------------------------------------------------------
-    ===================================== 作业 ===================================== */
+    // Read 1024-byte header
+    auto header = ReadSeveralBytesFromIfstream(1024, &ifs);
+    magic_number_ = BytesToType<uint32_t>(header, 0);
+    // uint32_t version = BytesToType<uint32_t>(header, 4);  // unused
+    vocab_size_ = BytesToType<uint32_t>(header, 8);
+
+    CHECK(kEotMap.contains(magic_number_)) << "Unknown tokenizer magic: " << magic_number_;
+    eot_token_ = kEotMap.at(magic_number_);
+
+    // Read vocabulary: each entry is 1-byte length followed by that many bytes
+    token_table_.resize(vocab_size_);
+    for (uint32_t i = 0; i < vocab_size_; ++i) {
+        const uint8_t len = ReadSeveralBytesFromIfstream(1, &ifs)[0];
+        auto bytes = ReadSeveralBytesFromIfstream(len, &ifs);
+        token_table_[i] = std::string(bytes.begin(), bytes.end());
+    }
 }
 
 std::string Tokenizer::Decode(uint32_t token_id) const {
-    /* ===================================== 作业 =====================================
-    TODO：实现token_id到文本的转换
-    功能描述：根据token_id返回对应的文本片段
-    ===================================== 作业 ===================================== */
-    return "";
+    CHECK_LT(token_id, token_table_.size()) << "Token ID out of range: " << token_id;
+    return token_table_[token_id];
 }
 
 void Tokenizer::GenerateText(infini_train::nn::Module &model, uint32_t batch_size, uint32_t sequence_length,
@@ -107,10 +116,34 @@ void Tokenizer::GenerateText(infini_train::nn::Module &model, uint32_t batch_siz
     uint64_t kRngState = kRngState;
     LOG(INFO) << "start generate text:";
     for (int t = prompt_len; t < text_length; t++) {
-        /* ===================================== 作业 =====================================
-        TODO：实现单步文本生成逻辑
-        HINT：调用model.Forward推理获取logits，根据推理结果进行随机采样，调用Decode获取文本结果
-        ===================================== 作业 ===================================== */
+        // Forward pass: logits shape (batch_size, sequence_length, vocab_size)
+        auto outputs = model.Forward({x});
+        auto logits = outputs[0];
+        const int64_t vocab_size = static_cast<int64_t>(logits->Dims().back());
+
+        // Move logits to CPU and pick position t-1 of batch 0
+        auto logits_cpu = logits->To(Device(DeviceType::kCPU, 0));
+        const float *lp = static_cast<const float *>(logits_cpu.DataPtr()) + (t - 1) * vocab_size;
+
+        // Numerically-stable softmax
+        std::vector<float> probs(vocab_size);
+        float mx = *std::max_element(lp, lp + vocab_size);
+        float sum = 0.0f;
+        for (int64_t i = 0; i < vocab_size; ++i) {
+            probs[i] = std::expf(lp[i] - mx);
+            sum += probs[i];
+        }
+        for (float &p : probs) { p /= sum; }
+
+        // Multinomial sample
+        const int next_tok = SampleMult(probs.data(), static_cast<int>(vocab_size), RandomF32(kRngState));
+
+        // Update token in CPU buffer and refresh device tensor
+        x_buff[t] = static_cast<int64_t>(next_tok);
+        x = std::make_shared<infini_train::Tensor>(x_tensor.To(device));
+
+        // Decode and print
+        std::cout << Decode(static_cast<uint32_t>(next_tok));
     }
     std::cout << std::endl;
 }

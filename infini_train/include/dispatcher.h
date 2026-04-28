@@ -15,13 +15,8 @@ public:
     template <typename FuncT> explicit KernelFunction(FuncT &&func) : func_ptr_(reinterpret_cast<void *>(func)) {}
 
     template <typename RetT, class... ArgsT> RetT Call(ArgsT... args) const {
-        // =================================== 作业 ===================================
-        // TODO：实现通用kernel调用接口
-        // 功能描述：将存储的函数指针转换为指定类型并调用
-        // =================================== 作业 ===================================
-
         using FuncT = RetT (*)(ArgsT...);
-        // TODO: 实现函数调用逻辑
+        return reinterpret_cast<FuncT>(func_ptr_)(args...);
     }
 
 private:
@@ -44,10 +39,8 @@ public:
     }
 
     template <typename FuncT> void Register(const KeyT &key, FuncT &&kernel) {
-        // =================================== 作业 ===================================
-        // TODO：实现kernel注册机制
-        // 功能描述：将kernel函数与设备类型、名称绑定
-        // =================================== 作业 ===================================
+        CHECK(!key_to_kernel_map_.contains(key)) << "Kernel already registered: " << key.second;
+        key_to_kernel_map_.emplace(key, KernelFunction(std::forward<FuncT>(kernel)));
     }
 
 private:
@@ -55,8 +48,9 @@ private:
 };
 } // namespace infini_train
 
+// Works at both file scope (file-scope const) and function scope (local const).
+// The trailing semicolon is included so callers at file scope don't need one;
+// callers at function scope that already add ';' end up with ';;' which is harmless.
 #define REGISTER_KERNEL(device, kernel_name, kernel_func)                                                              \
-    // =================================== 作业 ===================================
-    // TODO：实现自动注册宏
-    // 功能描述：在全局静态区注册kernel，避免显式初始化代码
-    // =================================== 作业 ===================================
+    [[maybe_unused]] const bool kKernelRegistered_##kernel_name =                                                      \
+        (infini_train::Dispatcher::Instance().Register({device, #kernel_name}, kernel_func), true);

@@ -10,26 +10,85 @@
 #include "infini_train/include/tensor.h"
 
 namespace infini_train::kernels::cpu {
-std::shared_ptr<Tensor> MatmulForward(const std::shared_ptr<Tensor> &input, const std::shared_ptr<Tensor> &other) {
-    // =================================== 作业 ===================================
-    // TODO：实现CPU上的矩阵乘法前向计算
-    // REF:
-    // =================================== 作业 ===================================
 
-    auto output = std::make_shared<Tensor>();
-    return {output};
+using RowMajorMatf = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
+
+std::shared_ptr<Tensor> MatmulForward(const std::shared_ptr<Tensor> &input, const std::shared_ptr<Tensor> &other) {
+    const auto &input_dims = input->Dims();
+    const auto &other_dims = other->Dims();
+    CHECK_GE(input_dims.size(), 2);
+    CHECK_GE(other_dims.size(), 2);
+    const int64_t k = *input_dims.rbegin();
+    const int64_t n = *other_dims.rbegin();
+    CHECK_EQ(k, *(other_dims.rbegin() + 1));
+
+    if (other_dims.size() == 2) {
+        // Broadcast: input[..., K] @ other[K, N]
+        auto output_dims = input_dims;
+        *output_dims.rbegin() = n;
+        auto output = std::make_shared<Tensor>(output_dims, DataType::kFLOAT32);
+        output->EigenMatrix() = input->EigenMatrix() * other->EigenMatrix();
+        return output;
+    }
+
+    // Batched: input[..., M, K] @ other[..., K, N]
+    CHECK_EQ(input_dims.size(), other_dims.size());
+    const int64_t m = *(input_dims.rbegin() + 1);
+    int64_t batch = 1;
+    for (size_t i = 0; i < input_dims.size() - 2; ++i) {
+        CHECK_EQ(input_dims[i], other_dims[i]);
+        batch *= input_dims[i];
+    }
+    auto output_dims = input_dims;
+    *output_dims.rbegin() = n;
+    auto output = std::make_shared<Tensor>(output_dims, DataType::kFLOAT32);
+    const float *a = static_cast<const float *>(input->DataPtr());
+    const float *b = static_cast<const float *>(other->DataPtr());
+    float *c = static_cast<float *>(output->DataPtr());
+    for (int64_t i = 0; i < batch; ++i) {
+        Eigen::Map<RowMajorMatf>(c + i * m * n, m, n).noalias() =
+            Eigen::Map<const RowMajorMatf>(a + i * m * k, m, k) *
+            Eigen::Map<const RowMajorMatf>(b + i * k * n, k, n);
+    }
+    return output;
 }
 
 std::tuple<std::shared_ptr<Tensor>, std::shared_ptr<Tensor>>
 MatmulBackward(const std::shared_ptr<Tensor> &input, const std::shared_ptr<Tensor> &other,
                const std::shared_ptr<Tensor> &grad_output) {
-    // =================================== 作业 ===================================
-    // TODO：实现CPU上的矩阵乘法反向传播
-    // REF:
-    // =================================== 作业 ===================================
+    const auto &input_dims = input->Dims();
+    const auto &other_dims = other->Dims();
+    const int64_t k = *input_dims.rbegin();
+    const int64_t n = *other_dims.rbegin();
 
-    auto grad_input = std::make_shared<Tensor>();
-    auto grad_other = std::make_shared<Tensor>();
+    auto grad_input = std::make_shared<Tensor>(input_dims, DataType::kFLOAT32);
+    auto grad_other = std::make_shared<Tensor>(other_dims, DataType::kFLOAT32);
+
+    if (other_dims.size() == 2) {
+        // grad_input = grad_output @ other^T
+        grad_input->EigenMatrix() = grad_output->EigenMatrix() * other->EigenMatrix().transpose();
+        // grad_other = input^T @ grad_output
+        grad_other->EigenMatrix() = input->EigenMatrix().transpose() * grad_output->EigenMatrix();
+        return {grad_input, grad_other};
+    }
+
+    // Batched backward
+    const int64_t m = *(input_dims.rbegin() + 1);
+    int64_t batch = 1;
+    for (size_t i = 0; i < input_dims.size() - 2; ++i) { batch *= input_dims[i]; }
+    const float *go = static_cast<const float *>(grad_output->DataPtr());
+    const float *a = static_cast<const float *>(input->DataPtr());
+    const float *b = static_cast<const float *>(other->DataPtr());
+    float *ga = static_cast<float *>(grad_input->DataPtr());
+    float *gb = static_cast<float *>(grad_other->DataPtr());
+    for (int64_t i = 0; i < batch; ++i) {
+        Eigen::Map<RowMajorMatf>(ga + i * m * k, m, k).noalias() =
+            Eigen::Map<const RowMajorMatf>(go + i * m * n, m, n) *
+            Eigen::Map<const RowMajorMatf>(b + i * k * n, k, n).transpose();
+        Eigen::Map<RowMajorMatf>(gb + i * k * n, k, n).noalias() =
+            Eigen::Map<const RowMajorMatf>(a + i * m * k, m, k).transpose() *
+            Eigen::Map<const RowMajorMatf>(go + i * m * n, m, n);
+    }
     return {grad_input, grad_other};
 }
 
