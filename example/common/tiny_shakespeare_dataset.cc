@@ -172,9 +172,10 @@ TinyShakespeareFile ReadTinyShakespeareFile(const std::string &path, size_t sequ
         buffer
     );
     return text_file;
+}
 } // namespace
 
-TinyShakespeareDataset::TinyShakespeareDataset(const std::string &filepath, size_t sequence_length) {
+TinyShakespeareDataset::TinyShakespeareDataset(const std::string &filepath, size_t sequence_length) 
     // =================================== 作业 ===================================
     // TODO：初始化数据集实例
     // HINT: 调用ReadTinyShakespeareFile加载数据文件
@@ -200,7 +201,6 @@ TinyShakespeareDataset::TinyShakespeareDataset(const std::string &filepath, size
         static_cast<int>(text_file_.tensor.Dtype()),
         static_cast<int>(DataType::kINT64)
     );
-    }
 }
 
 std::pair<std::shared_ptr<infini_train::Tensor>, std::shared_ptr<infini_train::Tensor>>

@@ -282,8 +282,47 @@ std::shared_ptr<Tensor> Tensor::Flatten(int64_t start, int64_t end) {
     // TODO：实现张量扁平化操作，将指定维度范围[start, end]内的所有维度合并为一个维度
     // HINT:
     // =================================== 作业 ===================================
+    const int64_t rank = static_cast<int64_t>(dims_.size());
+    CHECK_GT(rank, 0);
 
-    return std::make_shared<Tensor>();
+    // 支持负数维度，例如 -1 表示最后一维
+    if (start < 0) {
+        start += rank;
+    }
+    if (end < 0) {
+        end += rank;
+    }
+
+    // 检查维度范围是否合法
+    CHECK_GE(start, 0);
+    CHECK_LT(start, rank);
+    CHECK_GE(end, 0);
+    CHECK_LT(end, rank);
+    CHECK_LE(start, end);
+
+    std::vector<int64_t> new_shape;
+    new_shape.reserve(
+        static_cast<size_t>(rank - (end - start))
+    );
+
+    // 保留 start 前面的维度
+    for (int64_t i = 0; i < start; ++i) {
+        new_shape.push_back(dims_[i]);
+    }
+
+    // 将 [start, end] 范围内的维度相乘
+    int64_t flattened_dim = 1;
+    for (int64_t i = start; i <= end; ++i) {
+        flattened_dim *= dims_[i];
+    }
+    new_shape.push_back(flattened_dim);
+
+    // 保留 end 后面的维度
+    for (int64_t i = end + 1; i < rank; ++i) {
+        new_shape.push_back(dims_[i]);
+    }
+
+    return Contiguous()->View(new_shape);
 }
 
 std::shared_ptr<Tensor> Tensor::Squeeze(int64_t dim) {
@@ -358,6 +397,41 @@ void Tensor::Backward(std::shared_ptr<Tensor> gradient, bool retain_graph, bool 
     // TODO：实现自动微分反向传播
     // 功能描述：1. 计算当前张量对叶子节点的梯度    2. 支持多输出场景的梯度累加
     // =================================== 作业 ===================================
+     CHECK(requires_grad_)
+        << "Cannot call Backward on a tensor that does not require gradients";
+
+    // 当前版本暂未实际使用这两个参数
+    (void)retain_graph;
+    (void)create_graph;
+
+    // 没有手动传入梯度时，只允许标量 Tensor 自动使用梯度 1
+    if (!gradient) {
+        CHECK_EQ(NumElements(), 1)
+            << "Gradient must be provided for non-scalar tensors";
+
+        gradient =
+            std::make_shared<Tensor>(dims_, dtype_, GetDevice());
+        gradient->Fill<float>(1.0f);
+    }
+
+    // 检查传入梯度和当前 Tensor 的元素数量是否一致
+    CHECK_EQ(gradient->NumElements(), NumElements());
+
+    // 非叶子节点：从产生当前 Tensor 的 Function 开始反向传播
+    if (grad_fn_) {
+        grad_fn_->BackwardPartial(gradient, output_idx_);
+        return;
+    }
+
+    // 叶子节点：直接将梯度累加到自己的 grad_ 中
+    CHECK(is_leaf_);
+    CHECK(grad_);
+
+    auto device = GetDevice().Type();
+    auto kernel =
+        Dispatcher::Instance().GetKernel({device, "AccumulateGrad"});
+
+    kernel.Call<void>(gradient, 1.0f, grad_);
 }
 
 void Tensor::ZeroGrad() {

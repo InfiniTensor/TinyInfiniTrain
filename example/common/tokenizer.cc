@@ -78,6 +78,87 @@ Tokenizer::Tokenizer(const std::string &filepath) {
     | magic(4B) | version(4B) | vocab_size(4B) | reserved(1012B) | token词表数据       |
     ----------------------------------------------------------------------------------
     ===================================== 作业 ===================================== */
+    // 检查词表文件是否存在
+    if (!std::filesystem::exists(filepath)) {
+        LOG(FATAL) << "File not found: " << filepath;
+    }
+
+    // 使用二进制方式打开文件
+    std::ifstream ifs(filepath, std::ios::binary);
+    CHECK(ifs.is_open())
+        << "Failed to open tokenizer file: " << filepath;
+
+    // 读取前 1024 字节文件头
+    const auto header =
+        ReadSeveralBytesFromIfstream(1024, &ifs);
+
+    CHECK(ifs)
+        << "Failed to read tokenizer header";
+
+    // 解析文件头
+    magic_number_ =
+        BytesToType<uint32_t>(header, 0);
+
+    const uint32_t version_number =
+        BytesToType<uint32_t>(header, 4);
+
+    vocab_size_ =
+        BytesToType<uint32_t>(header, 8);
+
+    // 检查是否为支持的 Tokenizer 类型
+    CHECK(kEotMap.contains(magic_number_))
+        << "Unsupported tokenizer magic: "
+        << magic_number_;
+
+    const Version version =
+        static_cast<Version>(version_number);
+
+    // 不同版本确定 EOT token 的方式不同
+    if (version == Version::kV1) {
+        eot_token_ = kEotMap.at(magic_number_);
+    } else if (version == Version::kV2) {
+        eot_token_ =
+            BytesToType<uint32_t>(header, 12);
+    } else {
+        LOG(FATAL)
+            << "Unsupported tokenizer version: "
+            << version_number;
+    }
+
+    // 为整个词表分配空间
+    token_table_.resize(vocab_size_);
+
+    // 逐个读取 token 文本
+    for (uint32_t token_id = 0;
+         token_id < vocab_size_;
+         ++token_id) {
+
+        // 每个 token 的第一个字节表示文本长度
+        uint8_t length = 0;
+
+        ifs.read(
+            reinterpret_cast<char *>(&length),
+            sizeof(length)
+        );
+
+        CHECK(ifs)
+            << "Failed to read token length, token_id = "
+            << token_id;
+
+        // 再读取 length 个字节的文本
+        std::vector<char> buffer(length);
+
+        if (length > 0) {
+            ifs.read(buffer.data(), length);
+
+            CHECK(ifs)
+                << "Failed to read token data, token_id = "
+                << token_id;
+        }
+
+        token_table_[token_id] =
+            std::string(buffer.begin(), buffer.end());
+    }
 }
 
 std::string Tokenizer::Decode(uint32_t token_id) const {
@@ -85,7 +166,10 @@ std::string Tokenizer::Decode(uint32_t token_id) const {
     TODO：实现token_id到文本的转换
     功能描述：根据token_id返回对应的文本片段
     ===================================== 作业 ===================================== */
-    return "";
+     if (token_id >= vocab_size_) {
+        return "[INVALID_TOKEN]";
+    }
+    return token_table_[token_id];
 }
 
 void Tokenizer::GenerateText(infini_train::nn::Module &model, uint32_t batch_size, uint32_t sequence_length,
@@ -104,13 +188,36 @@ void Tokenizer::GenerateText(infini_train::nn::Module &model, uint32_t batch_siz
     std::cout << "The meaning of life is";
 
     auto x = std::make_shared<infini_train::Tensor>(x_tensor.To(device));
-    uint64_t kRngState = kRngState;
+    uint64_t rng_state = kRngState;
     LOG(INFO) << "start generate text:";
+    auto cpu_device = Device();
     for (int t = prompt_len; t < text_length; t++) {
         /* ===================================== 作业 =====================================
         TODO：实现单步文本生成逻辑
         HINT：调用model.Forward推理获取logits，根据推理结果进行随机采样，调用Decode获取文本结果
         ===================================== 作业 ===================================== */
+        x = std::make_shared<infini_train::Tensor>(x->To(device));
+
+        auto logits = model.Forward({x})[0];
+        auto probabilities = nn::function::Softmax(logits, -1);
+        auto probabilities_cpu = probabilities->To(cpu_device);
+
+        auto vocab_size = logits->Dims()[2];
+        float *probs =
+            static_cast<float *>(probabilities_cpu.DataPtr())
+            + (t - 1) * vocab_size;
+
+        float coin = RandomF32(rng_state);
+        int next_token = SampleMult(probs, vocab_size, coin);
+
+        x = std::make_shared<infini_train::Tensor>(
+        x->To(cpu_device)
+        );
+
+        auto data = static_cast<int64_t *>(x->DataPtr());
+        data[t] = next_token;
+
+        std::cout << Decode(next_token);
     }
     std::cout << std::endl;
 }
