@@ -16,8 +16,69 @@ std::shared_ptr<Tensor> MatmulForward(const std::shared_ptr<Tensor> &input, cons
     // REF:
     // =================================== 作业 ===================================
 
-    auto output = std::make_shared<Tensor>();
-    return {output};
+    const auto &input_dims = input->Dims();
+    const auto &other_dims = other->Dims();
+
+    // 矩阵至少需要二维
+    CHECK_GE(input_dims.size(), 2);
+    CHECK_EQ(input_dims.size(), other_dims.size());
+
+    const size_t rank = input_dims.size();
+
+    // A: [..., M, K]
+    // B: [..., K, N]
+    const int64_t M = input_dims[rank - 2];
+    const int64_t K = input_dims[rank - 1];
+    const int64_t N = other_dims[rank - 1];
+
+    // 检查矩阵乘法的中间维度
+    CHECK_EQ(K, other_dims[rank - 2]);
+
+    // 计算 batch 数量，并检查批次维度一致
+    int64_t batch_size = 1;
+    for (size_t dim = 0; dim + 2 < rank; ++dim) {
+        CHECK_EQ(input_dims[dim], other_dims[dim]);
+        batch_size *= input_dims[dim];
+    }
+
+    // 输出形状：[..., M, N]
+    std::vector<int64_t> output_dims = input_dims;
+    output_dims[rank - 1] = N;
+
+    auto output = std::make_shared<Tensor>(
+        output_dims,
+        input->Dtype(),
+        input->GetDevice()
+    );
+
+    const auto *input_data =
+        static_cast<const float *>(input->DataPtr());
+    const auto *other_data =
+        static_cast<const float *>(other->DataPtr());
+    auto *output_data =
+        static_cast<float *>(output->DataPtr());
+
+    // 每一个 batch 分别进行矩阵乘法
+    for (int64_t batch = 0; batch < batch_size; ++batch) {
+        const int64_t input_offset = batch * M * K;
+        const int64_t other_offset = batch * K * N;
+        const int64_t output_offset = batch * M * N;
+
+        for (int64_t i = 0; i < M; ++i) {
+            for (int64_t j = 0; j < N; ++j) {
+                float sum = 0.0f;
+
+                for (int64_t k = 0; k < K; ++k) {
+                    sum +=
+                        input_data[input_offset + i * K + k] *
+                        other_data[other_offset + k * N + j];
+                }
+
+                output_data[output_offset + i * N + j] = sum;
+            }
+        }
+    }
+    return output;
 }
 
 std::tuple<std::shared_ptr<Tensor>, std::shared_ptr<Tensor>>
@@ -27,9 +88,113 @@ MatmulBackward(const std::shared_ptr<Tensor> &input, const std::shared_ptr<Tenso
     // TODO：实现CPU上的矩阵乘法反向传播
     // REF:
     // =================================== 作业 ===================================
+    const auto &input_dims = input->Dims();
+    const auto &other_dims = other->Dims();
+    const auto &grad_dims = grad_output->Dims();
 
-    auto grad_input = std::make_shared<Tensor>();
-    auto grad_other = std::make_shared<Tensor>();
+    CHECK_GE(input_dims.size(), 2);
+    CHECK_EQ(input_dims.size(), other_dims.size());
+    CHECK_EQ(input_dims.size(), grad_dims.size());
+
+    const size_t rank = input_dims.size();
+
+    // input:       [..., M, K]
+    // other:       [..., K, N]
+    // grad_output: [..., M, N]
+    const int64_t M = input_dims[rank - 2];
+    const int64_t K = input_dims[rank - 1];
+    const int64_t N = other_dims[rank - 1];
+
+    CHECK_EQ(other_dims[rank - 2], K);
+    CHECK_EQ(grad_dims[rank - 2], M);
+    CHECK_EQ(grad_dims[rank - 1], N);
+
+    int64_t batch_size = 1;
+    for (size_t dim = 0; dim + 2 < rank; ++dim) {
+        CHECK_EQ(input_dims[dim], other_dims[dim]);
+        CHECK_EQ(input_dims[dim], grad_dims[dim]);
+        batch_size *= input_dims[dim];
+    }
+
+    auto grad_input = std::make_shared<Tensor>(
+        input_dims,
+        input->Dtype(),
+        input->GetDevice()
+    );
+
+    auto grad_other = std::make_shared<Tensor>(
+        other_dims,
+        other->Dtype(),
+        other->GetDevice()
+    );
+
+    const auto *input_data =
+        static_cast<const float *>(input->DataPtr());
+    const auto *other_data =
+        static_cast<const float *>(other->DataPtr());
+    const auto *grad_output_data =
+        static_cast<const float *>(grad_output->DataPtr());
+
+    auto *grad_input_data =
+        static_cast<float *>(grad_input->DataPtr());
+    auto *grad_other_data =
+        static_cast<float *>(grad_other->DataPtr());
+
+    for (int64_t batch = 0; batch < batch_size; ++batch) {
+        const int64_t input_offset = batch * M * K;
+        const int64_t other_offset = batch * K * N;
+        const int64_t grad_output_offset = batch * M * N;
+
+        /*
+         * grad_input = grad_output × other^T
+         *
+         * [M, N] × [N, K] = [M, K]
+         */
+        for (int64_t i = 0; i < M; ++i) {
+            for (int64_t k = 0; k < K; ++k) {
+                float sum = 0.0f;
+
+                for (int64_t j = 0; j < N; ++j) {
+                    sum +=
+                        grad_output_data[
+                            grad_output_offset + i * N + j
+                        ] *
+                        other_data[
+                            other_offset + k * N + j
+                        ];
+                }
+
+                grad_input_data[
+                    input_offset + i * K + k
+                ] = sum;
+            }
+        }
+
+        /*
+         * grad_other = input^T × grad_output
+         *
+         * [K, M] × [M, N] = [K, N]
+         */
+        for (int64_t k = 0; k < K; ++k) {
+            for (int64_t j = 0; j < N; ++j) {
+                float sum = 0.0f;
+
+                for (int64_t i = 0; i < M; ++i) {
+                    sum +=
+                        input_data[
+                            input_offset + i * K + k
+                        ] *
+                        grad_output_data[
+                            grad_output_offset + i * N + j
+                        ];
+                }
+
+                grad_other_data[
+                    other_offset + k * N + j
+                ] = sum;
+            }
+        }
+    }
     return {grad_input, grad_other};
 }
 
