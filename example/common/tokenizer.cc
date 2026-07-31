@@ -196,29 +196,75 @@ void Tokenizer::GenerateText(infini_train::nn::Module &model, uint32_t batch_siz
         TODO：实现单步文本生成逻辑
         HINT：调用model.Forward推理获取logits，根据推理结果进行随机采样，调用Decode获取文本结果
         ===================================== 作业 ===================================== */
-        x = std::make_shared<infini_train::Tensor>(x->To(device));
+auto parameters = model.Parameters();
 
-        auto logits = model.Forward({x})[0];
-        auto probabilities = nn::function::Softmax(logits, -1);
-        auto probabilities_cpu = probabilities->To(cpu_device);
+        std::vector<bool> requires_grad_flags;
+        requires_grad_flags.reserve(parameters.size());
 
-        auto vocab_size = logits->Dims()[2];
-        float *probs =
-            static_cast<float *>(probabilities_cpu.DataPtr())
-            + (t - 1) * vocab_size;
-
-        float coin = RandomF32(rng_state);
-        int next_token = SampleMult(probs, vocab_size, coin);
+        for (const auto &parameter : parameters) {
+            requires_grad_flags.push_back(
+                parameter->requires_grad()
+            );
+            parameter->set_requires_grad(false);
+        }
 
         x = std::make_shared<infini_train::Tensor>(
-        x->To(cpu_device)
+            x->To(device)
         );
 
-        auto data = static_cast<int64_t *>(x->DataPtr());
+        auto logits = model.Forward({x})[0];
+
+        const int64_t vocab_size =
+            logits->Dims()[2];
+
+        auto current_logits = logits->Slice(
+            {0, t - 1, 0},
+            {1, t, vocab_size},
+            {1, 1, 1}
+        );
+
+        auto probabilities =
+            nn::function::Softmax(
+                current_logits,
+                -1
+            );
+
+        auto probabilities_cpu =
+            probabilities->To(cpu_device);
+
+        for (size_t i = 0;
+             i < parameters.size();
+             ++i) {
+            parameters[i]->set_requires_grad(
+                requires_grad_flags[i]
+            );
+        }
+
+        float *probs =
+            static_cast<float *>(
+                probabilities_cpu.DataPtr()
+            );
+
+        float coin = RandomF32(rng_state);
+
+        int next_token = SampleMult(
+            probs,
+            static_cast<int>(vocab_size),
+            coin
+        );
+
+        x = std::make_shared<infini_train::Tensor>(
+            x->To(cpu_device)
+        );
+
+        auto data =
+            static_cast<int64_t *>(x->DataPtr());
+
         data[t] = next_token;
 
         std::cout << Decode(next_token);
     }
+
     std::cout << std::endl;
 }
 } // namespace infini_train

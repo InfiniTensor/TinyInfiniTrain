@@ -61,7 +61,7 @@ TinyShakespeareFile ReadTinyShakespeareFile(const std::string &path, size_t sequ
     | magic(4B) | version(4B) | num_toks(4B) | reserved(1012B) | token数据           |
     ----------------------------------------------------------------------------------
        =================================== 作业 =================================== */
-     CHECK_GT(sequence_length, 0);
+            CHECK_GT(sequence_length, 0);
 
     // 检查文件是否存在
     if (!std::filesystem::exists(path)) {
@@ -104,7 +104,9 @@ TinyShakespeareFile ReadTinyShakespeareFile(const std::string &path, size_t sequ
 
     // 将全部 token 按 sequence_length 分组
     const int64_t num_sequences =
-        static_cast<int64_t>(num_tokens / sequence_length);
+        static_cast<int64_t>(
+            num_tokens / sequence_length
+        );
 
     CHECK_GT(num_sequences, 0);
 
@@ -114,10 +116,12 @@ TinyShakespeareFile ReadTinyShakespeareFile(const std::string &path, size_t sequ
     };
 
     const size_t num_values =
-        static_cast<size_t>(num_sequences) * sequence_length;
+        static_cast<size_t>(num_sequences)
+        * sequence_length;
 
     const size_t data_size_in_bytes =
-        kTypeToSize.at(text_file.type) * num_values;
+        kTypeToSize.at(text_file.type)
+        * num_values;
 
     /*
      * 文件中可能是 uint16 或 uint32，
@@ -129,7 +133,9 @@ TinyShakespeareFile ReadTinyShakespeareFile(const std::string &path, size_t sequ
     );
 
     auto *destination =
-        static_cast<int64_t *>(text_file.tensor.DataPtr());
+        static_cast<int64_t *>(
+            text_file.tensor.DataPtr()
+        );
 
     // 根据文件类型创建对应的临时缓冲区
     std::variant<
@@ -137,25 +143,34 @@ TinyShakespeareFile ReadTinyShakespeareFile(const std::string &path, size_t sequ
         std::vector<int32_t>
     > buffer;
 
-    if (text_file.type == TinyShakespeareType::kUINT16) {
+    if (
+        text_file.type ==
+        TinyShakespeareType::kUINT16
+    ) {
         // GPT-2 最大序列长度
         CHECK_LE(sequence_length, 1024);
 
-        buffer = std::vector<uint16_t>(num_values);
+        buffer =
+            std::vector<uint16_t>(num_values);
+
     } else if (
-        text_file.type == TinyShakespeareType::kUINT32
+        text_file.type ==
+        TinyShakespeareType::kUINT32
     ) {
         // LLaMA 3 最大序列长度
         CHECK_LE(sequence_length, 8192);
 
-        buffer = std::vector<int32_t>(num_values);
+        buffer =
+            std::vector<int32_t>(num_values);
     }
 
     // 读取 token，并统一转换成 int64_t
     std::visit(
         [&](auto &tokens) {
             ifs.read(
-                reinterpret_cast<char *>(tokens.data()),
+                reinterpret_cast<char *>(
+                    tokens.data()
+                ),
                 static_cast<std::streamsize>(
                     data_size_in_bytes
                 )
@@ -164,13 +179,20 @@ TinyShakespeareFile ReadTinyShakespeareFile(const std::string &path, size_t sequ
             CHECK(ifs.good() || ifs.eof())
                 << "Failed to read dataset tokens";
 
-            for (size_t i = 0; i < tokens.size(); ++i) {
+            for (
+                size_t i = 0;
+                i < tokens.size();
+                ++i
+            ) {
                 destination[i] =
-                    static_cast<int64_t>(tokens[i]);
+                    static_cast<int64_t>(
+                        tokens[i]
+                    );
             }
         },
         buffer
     );
+
     return text_file;
 }
 } // namespace
@@ -180,7 +202,7 @@ TinyShakespeareDataset::TinyShakespeareDataset(const std::string &filepath, size
     // TODO：初始化数据集实例
     // HINT: 调用ReadTinyShakespeareFile加载数据文件
     // =================================== 作业 ===================================
-    : text_file_(
+        : text_file_(
           ReadTinyShakespeareFile(
               filepath,
               sequence_length
@@ -190,16 +212,24 @@ TinyShakespeareDataset::TinyShakespeareDataset(const std::string &filepath, size
       sequence_size_in_bytes_(
           sequence_length * sizeof(int64_t)
       ),
-      num_samples_(text_file_.dims[0] - 1) {
+      num_samples_(
+          text_file_.dims[0] - 1
+      ) {
 
     CHECK_EQ(
         text_file_.dims[1],
-        static_cast<int64_t>(sequence_length_)
+        static_cast<int64_t>(
+            sequence_length_
+        )
     );
 
     CHECK_EQ(
-        static_cast<int>(text_file_.tensor.Dtype()),
-        static_cast<int>(DataType::kINT64)
+        static_cast<int>(
+            text_file_.tensor.Dtype()
+        ),
+        static_cast<int>(
+            DataType::kINT64
+        )
     );
 }
 
