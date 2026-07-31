@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <memory>
+#include <unordered_map>
 #include <vector>
 
 #include "glog/logging.h"
@@ -35,6 +36,11 @@ public:
     Forward(const std::vector<std::shared_ptr<infini_train::Tensor>> &x) override;
 
     void To(infini_train::Device device) override;
+
+protected:
+    void To(infini_train::Device device,
+            std::unordered_map<const infini_train::Tensor *, std::shared_ptr<infini_train::Tensor>> &moved_tensors)
+        override;
 
 private:
     GPT2Config config_;

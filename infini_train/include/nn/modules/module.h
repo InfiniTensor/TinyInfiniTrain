@@ -3,6 +3,7 @@
 #include <functional>
 #include <memory>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "infini_train/include/device.h"
@@ -37,7 +38,12 @@ public:
 
     void Apply(std::function<void(Module *)> fn);
 
+private:
+    void CollectParameters(std::vector<std::shared_ptr<Tensor>> &params, std::unordered_set<const Tensor *> &seen) const;
+
 protected:
+    virtual void To(Device device, std::unordered_map<const Tensor *, std::shared_ptr<Tensor>> &moved_tensors);
+
     Device device_; // CPU by default
     const std::string type_ = kUndefinedType;
     std::unordered_map<std::string, std::unique_ptr<Module>> modules_;

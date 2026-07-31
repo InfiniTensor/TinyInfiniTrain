@@ -60,8 +60,12 @@ CausalSelfAttention::CausalSelfAttention(const GPT2Config &config)
                 ->View({1, 1, config_.block_size, config_.block_size});
 }
 
-void CausalSelfAttention::To(infini_train::Device device) {
-    nn::Module::To(device);
+void CausalSelfAttention::To(infini_train::Device device) { nn::Module::To(device); }
+
+void CausalSelfAttention::To(
+    infini_train::Device device,
+    std::unordered_map<const infini_train::Tensor *, std::shared_ptr<infini_train::Tensor>> &moved_tensors) {
+    nn::Module::To(device, moved_tensors);
     bias_ = std::make_shared<infini_train::Tensor>(bias_->To(device));
 }
 

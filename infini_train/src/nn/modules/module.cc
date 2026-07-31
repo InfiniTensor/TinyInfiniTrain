@@ -2,6 +2,8 @@
 
 #include <memory>
 #include <vector>
+#include <unordered_map>
+#include <unordered_set>
 
 #include "infini_train/include/device.h"
 #include "infini_train/include/tensor.h"
@@ -11,11 +13,19 @@ const std::string &Module::type() const { return type_; }
 
 std::vector<std::shared_ptr<Tensor>> Module::Parameters() const {
     std::vector<std::shared_ptr<Tensor>> params;
-    for (auto &[_, param] : parameters_) { params.push_back(param); }
-    for (auto &[_, layer] : modules_) {
-        for (auto &param : layer->Parameters()) { params.push_back(param); }
-    }
+    std::unordered_set<const Tensor *> seen;
+    CollectParameters(params, seen);
     return params;
+}
+
+void Module::CollectParameters(std::vector<std::shared_ptr<Tensor>> &params,
+                               std::unordered_set<const Tensor *> &seen) const {
+    for (auto &[_, param] : parameters_) {
+        if (seen.insert(param.get()).second) {
+            params.push_back(param);
+        }
+    }
+    for (auto &[_, layer] : modules_) { layer->CollectParameters(params, seen); }
 }
 
 bool Module::has_parameter(const std::string &name) const { return parameters_.find(name) != parameters_.end(); }
@@ -56,18 +66,25 @@ std::unordered_map<std::string, std::shared_ptr<Tensor>> Module::StateDict() con
 }
 
 void Module::To(Device device) {
-    if (device == device_) {
-        return;
+    std::unordered_map<const Tensor *, std::shared_ptr<Tensor>> moved_tensors;
+    To(device, moved_tensors);
+}
+
+void Module::To(Device device, std::unordered_map<const Tensor *, std::shared_ptr<Tensor>> &moved_tensors) {
+    if (device != device_) {
+        std::unordered_map<std::string, std::shared_ptr<Tensor>> new_parameters;
+        for (auto &[name, param] : parameters_) {
+            auto [it, inserted] = moved_tensors.emplace(param.get(), nullptr);
+            if (inserted) {
+                it->second = std::make_shared<Tensor>(param->To(device));
+            }
+            new_parameters.emplace(name, it->second);
+        }
+        parameters_ = std::move(new_parameters);
+        device_ = device;
     }
 
-    std::unordered_map<std::string, std::shared_ptr<Tensor>> new_parameters;
-    for (auto &[name, param] : parameters_) {
-        new_parameters.emplace(name, std::make_shared<Tensor>(param->To(device)));
-    }
-    parameters_ = std::move(new_parameters);
-    device_ = device;
-
-    for (auto &[_, layer] : modules_) { layer->To(device); }
+    for (auto &[_, layer] : modules_) { layer->To(device, moved_tensors); }
 }
 
 void Module::Apply(std::function<void(Module *)> fn) {

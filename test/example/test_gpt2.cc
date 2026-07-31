@@ -10,6 +10,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <fstream>
 #include <vector>
 #include <gtest/gtest.h>
@@ -200,6 +201,97 @@ void LogTensorSummary(int run_id, DiagnosticMode mode, const char *stage, int st
               << " min=" << summary.min << " max=" << summary.max << " mean=" << summary.mean
               << " l2=" << summary.l2 << " finite=" << summary.finite;
 }
+
+struct WeightTyingSnapshot {
+    std::shared_ptr<Tensor> wte;
+    std::shared_ptr<Tensor> lm_head;
+    std::shared_ptr<Tensor> wte_grad;
+    std::shared_ptr<Tensor> lm_head_grad;
+};
+
+class InspectableSGD final : public optimizers::SGD {
+public:
+    using optimizers::SGD::SGD;
+
+    const std::vector<std::shared_ptr<Tensor>> &params() const { return params_; }
+};
+
+WeightTyingSnapshot GetWeightTyingSnapshot(GPT2 &model) {
+    const auto state_dict = model.StateDict();
+    const auto wte_it = state_dict.find("transformer.wte.weight");
+    const auto lm_head_it = state_dict.find("lm_head.weight");
+    CHECK(wte_it != state_dict.end());
+    CHECK(lm_head_it != state_dict.end());
+    return {
+        .wte = wte_it->second,
+        .lm_head = lm_head_it->second,
+        .wte_grad = wte_it->second->grad(),
+        .lm_head_grad = lm_head_it->second->grad(),
+    };
+}
+
+size_t CountPointerOccurrences(const std::vector<std::shared_ptr<Tensor>> &params, const std::shared_ptr<Tensor> &needle) {
+    return std::count_if(params.begin(), params.end(), [&](const auto &param) { return param.get() == needle.get(); });
+}
+
+size_t CountDataPtrOccurrences(const std::vector<std::shared_ptr<Tensor>> &params, const void *data_ptr) {
+    return std::count_if(params.begin(), params.end(), [&](const auto &param) { return param->DataPtr() == data_ptr; });
+}
+
+size_t CountUniqueTensorObjects(const std::vector<std::shared_ptr<Tensor>> &params) {
+    std::unordered_set<const Tensor *> objects;
+    for (const auto &param : params) {
+        objects.insert(param.get());
+    }
+    return objects.size();
+}
+
+size_t CountUniqueDataPtrs(const std::vector<std::shared_ptr<Tensor>> &params) {
+    std::unordered_set<const void *> data_ptrs;
+    for (const auto &param : params) {
+        data_ptrs.insert(param->DataPtr());
+    }
+    return data_ptrs.size();
+}
+
+void LogWeightTyingSnapshot(const char *stage, const WeightTyingSnapshot &snapshot) {
+    LOG(INFO) << "WEIGHT_TYING stage=" << stage
+              << " wte_tensor=" << snapshot.wte.get()
+              << " lm_head_tensor=" << snapshot.lm_head.get()
+              << " same_tensor=" << (snapshot.wte.get() == snapshot.lm_head.get())
+              << " wte_data=" << snapshot.wte->DataPtr()
+              << " lm_head_data=" << snapshot.lm_head->DataPtr()
+              << " same_data=" << (snapshot.wte->DataPtr() == snapshot.lm_head->DataPtr())
+              << " storage_data_ptr_proxy=" << snapshot.wte->DataPtr() << "/" << snapshot.lm_head->DataPtr()
+              << " wte_grad=" << snapshot.wte_grad.get()
+              << " lm_head_grad=" << snapshot.lm_head_grad.get()
+              << " same_grad=" << (snapshot.wte_grad.get() == snapshot.lm_head_grad.get())
+              << " wte_grad_data=" << (snapshot.wte_grad ? snapshot.wte_grad->DataPtr() : nullptr)
+              << " lm_head_grad_data=" << (snapshot.lm_head_grad ? snapshot.lm_head_grad->DataPtr() : nullptr)
+              << " same_grad_data=" << (snapshot.wte_grad && snapshot.lm_head_grad
+                                              && snapshot.wte_grad->DataPtr() == snapshot.lm_head_grad->DataPtr());
+}
+
+void LogOptimizerAliases(const char *stage, const std::vector<std::shared_ptr<Tensor>> &params,
+                         const WeightTyingSnapshot &snapshot) {
+    LOG(INFO) << "WEIGHT_TYING_OPT stage=" << stage
+              << " total_params=" << params.size()
+              << " unique_tensor_objects=" << CountUniqueTensorObjects(params)
+              << " unique_data_ptrs=" << CountUniqueDataPtrs(params)
+              << " wte_object_occurrences=" << CountPointerOccurrences(params, snapshot.wte)
+              << " lm_head_object_occurrences=" << CountPointerOccurrences(params, snapshot.lm_head)
+              << " shared_data_occurrences=" << CountDataPtrOccurrences(params, snapshot.wte->DataPtr());
+    for (size_t i = 0; i < params.size(); ++i) {
+        if (params[i].get() == snapshot.wte.get() || params[i].get() == snapshot.lm_head.get()
+            || params[i]->DataPtr() == snapshot.wte->DataPtr()) {
+            LOG(INFO) << "WEIGHT_TYING_OPT_PARAM stage=" << stage << " index=" << i
+                      << " tensor=" << params[i].get() << " data=" << params[i]->DataPtr()
+                      << " grad=" << params[i]->grad().get()
+                      << " grad_data=" << (params[i]->grad() ? params[i]->grad()->DataPtr() : nullptr);
+        }
+    }
+}
+
 } // namespace
 
 class GPT2TrainingTest : public ::testing::Test {
@@ -520,6 +612,69 @@ protected:
     int freq_generate_txt = 10;
     float learning_rate = 1e-4;
 };
+
+
+TEST_F(GPT2TrainingTest, WeightTyingPreservedAcrossDeviceMove) {
+    auto constructed_model = GPT2::FromLLMC(llmc_filepath);
+    const auto constructed = GetWeightTyingSnapshot(*constructed_model);
+    LogWeightTyingSnapshot("constructed_cpu", constructed);
+    EXPECT_EQ(constructed.wte.get(), constructed.lm_head.get());
+    EXPECT_EQ(constructed.wte->DataPtr(), constructed.lm_head->DataPtr());
+    constructed_model.reset();
+
+    const auto moved = GetWeightTyingSnapshot(*model);
+    LogWeightTyingSnapshot("after_to", moved);
+    EXPECT_EQ(moved.wte.get(), moved.lm_head.get()) << "weight tying object alias was broken by Module::To";
+    EXPECT_EQ(moved.wte->DataPtr(), moved.lm_head->DataPtr()) << "weight tying storage/data alias was broken by Module::To";
+
+    const auto params = model->Parameters();
+    LogOptimizerAliases("after_to", params, moved);
+    const auto shared_object_occurrences = CountPointerOccurrences(params, moved.wte);
+    const auto shared_data_occurrences = CountDataPtrOccurrences(params, moved.wte->DataPtr());
+    EXPECT_EQ(shared_object_occurrences, 1) << "shared weight appears multiple times by Tensor object in Parameters()";
+    EXPECT_EQ(shared_data_occurrences, 1) << "shared weight appears multiple times by data/storage in Parameters()";
+
+    InspectableSGD local_optimizer(params, learning_rate);
+    LogOptimizerAliases("optimizer_collected", local_optimizer.params(), moved);
+
+    auto train_iter = train_loader->begin();
+    local_optimizer.ZeroGrad();
+    auto [x, y] = *train_iter;
+    x = std::make_shared<Tensor>(x->To(device));
+    y = std::make_shared<Tensor>(y->To(device));
+
+    auto outputs = model->Forward({x, y});
+    auto local_logits = outputs[0];
+    ASSERT_NE(local_logits, nullptr);
+    auto loss = loss_fn->Forward({local_logits, y})[0];
+    ASSERT_NE(loss, nullptr);
+    loss->Backward();
+
+    const auto after_backward = GetWeightTyingSnapshot(*model);
+    LogWeightTyingSnapshot("after_backward", after_backward);
+    EXPECT_EQ(after_backward.wte_grad.get(), after_backward.lm_head_grad.get())
+        << "shared weight should expose the same grad object through both paths";
+    EXPECT_EQ(after_backward.wte_grad->DataPtr(), after_backward.lm_head_grad->DataPtr())
+        << "shared weight should expose the same grad storage through both paths";
+    const auto wte_grad_summary = SummarizeFloatTensor(*after_backward.wte_grad, 0);
+    const auto lm_head_grad_summary = SummarizeFloatTensor(*after_backward.lm_head_grad, 0);
+    LogTensorSummary(0, DiagnosticMode::kFull, "weight_tying_backward", 0, -1, "transformer.wte.weight.grad",
+                     wte_grad_summary);
+    LogTensorSummary(0, DiagnosticMode::kFull, "weight_tying_backward", 0, -1, "lm_head.weight.grad",
+                     lm_head_grad_summary);
+    EXPECT_EQ(wte_grad_summary.sample, lm_head_grad_summary.sample);
+    EXPECT_EQ(wte_grad_summary.l2, lm_head_grad_summary.l2);
+
+    local_optimizer.Step();
+    const auto after_step = GetWeightTyingSnapshot(*model);
+    LogWeightTyingSnapshot("after_optimizer_step", after_step);
+    EXPECT_EQ(after_step.wte.get(), after_step.lm_head.get());
+    EXPECT_EQ(after_step.wte->DataPtr(), after_step.lm_head->DataPtr());
+    const auto wte_summary = SummarizeFloatTensor(*after_step.wte, 0);
+    const auto lm_head_summary = SummarizeFloatTensor(*after_step.lm_head, 0);
+    EXPECT_EQ(wte_summary.sample, lm_head_summary.sample);
+    EXPECT_EQ(wte_summary.l2, lm_head_summary.l2);
+}
 
 TEST_F(GPT2TrainingTest, SingleStepDiagnostics) {
     auto train_iter = train_loader->begin();
