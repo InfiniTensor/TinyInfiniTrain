@@ -9,6 +9,7 @@
 #include "glog/logging.h"
 
 #include "infini_train/include/dispatcher.h"
+#include "infini_train/include/cuda_check.h"
 #include "infini_train/include/tensor.h"
 
 namespace infini_train::kernels::cuda {
@@ -112,7 +113,7 @@ std::shared_ptr<Tensor> CrossEntropyForward(const std::shared_ptr<Tensor> &input
     default:
         LOG(FATAL) << "Unsupported target data type: " << static_cast<int>(target->Dtype());
     }
-    cudaDeviceSynchronize();
+    CUDA_KERNEL_CHECK();
 
     auto loss_cpu = batched_output->To(Device());
     auto loss = std::make_shared<Tensor>(std::vector<int64_t>{}, DataType::kFLOAT32, Device());
@@ -219,6 +220,8 @@ std::shared_ptr<Tensor> CrossEntropyBackward(const std::shared_ptr<Tensor> &inpu
     default:
         LOG(FATAL) << "Unsupported target data type: " << static_cast<int>(target->Dtype());
     }
+
+    CUDA_KERNEL_CHECK();
 
     return {grad_input};
 }

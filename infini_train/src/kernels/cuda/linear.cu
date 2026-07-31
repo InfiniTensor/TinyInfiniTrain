@@ -1,27 +1,76 @@
 #include "cublas_v2.h"
 #include "glog/logging.h"
-#include <cub/block/block_reduce.cuh>
 
+#include <algorithm>
+#include <cub/block/block_reduce.cuh>
+#include <limits>
+
+#include "infini_train/include/cuda_check.h"
 #include "infini_train/include/dispatcher.h"
 #include "infini_train/include/tensor.h"
 
 namespace infini_train::kernels::cuda {
+namespace {
 
-#define CUDA_CHECK(call)                                                                                               \
-    do {                                                                                                               \
-        cudaError_t status = call;                                                                                     \
-        if (status != cudaSuccess) {                                                                                   \
-            LOG(FATAL) << "CUDA Error: " << cudaGetErrorString(status) << " at " << __FILE__ << ":" << __LINE__;       \
-        }                                                                                                              \
-    } while (0)
+const char *CublasOperationName(cublasOperation_t op) {
+    switch (op) {
+    case CUBLAS_OP_N:
+        return "N";
+    case CUBLAS_OP_T:
+        return "T";
+    case CUBLAS_OP_C:
+        return "C";
+    default:
+        return "unknown";
+    }
+}
 
-#define CUBLAS_CHECK(call)                                                                                             \
-    do {                                                                                                               \
-        cublasStatus_t status = call;                                                                                  \
-        if (status != CUBLAS_STATUS_SUCCESS) {                                                                         \
-            LOG(FATAL) << "CUBLAS Error: " << cublasGetStatusString(status) << " at " << __FILE__ << ":" << __LINE__;  \
-        }                                                                                                              \
-    } while (0)
+void CheckFitsInt(const char *context, const char *name, int64_t value) {
+    CHECK_GE(value, static_cast<int64_t>(0)) << context << " invalid " << name << "=" << value;
+    CHECK_LE(value, static_cast<int64_t>(std::numeric_limits<int>::max()))
+        << context << " " << name << " exceeds cuBLAS int range: " << value;
+}
+
+void CheckNonNegativeStride(const char *context, const char *name, int64_t value) {
+    CHECK_GE(value, static_cast<int64_t>(0)) << context << " invalid " << name << "=" << value;
+}
+
+void CheckGemmArgs(const char *context, cublasOperation_t trans_a, cublasOperation_t trans_b, int64_t m, int64_t n,
+                   int64_t k, int64_t lda, int64_t ldb, int64_t ldc) {
+    CHECK(trans_a == CUBLAS_OP_N || trans_a == CUBLAS_OP_T || trans_a == CUBLAS_OP_C)
+        << context << " invalid transA=" << CublasOperationName(trans_a);
+    CHECK(trans_b == CUBLAS_OP_N || trans_b == CUBLAS_OP_T || trans_b == CUBLAS_OP_C)
+        << context << " invalid transB=" << CublasOperationName(trans_b);
+
+    CheckFitsInt(context, "m", m);
+    CheckFitsInt(context, "n", n);
+    CheckFitsInt(context, "k", k);
+    CheckFitsInt(context, "lda", lda);
+    CheckFitsInt(context, "ldb", ldb);
+    CheckFitsInt(context, "ldc", ldc);
+
+    const int64_t min_lda = std::max<int64_t>(1, trans_a == CUBLAS_OP_N ? m : k);
+    const int64_t min_ldb = std::max<int64_t>(1, trans_b == CUBLAS_OP_N ? k : n);
+    const int64_t min_ldc = std::max<int64_t>(1, m);
+
+    CHECK_GE(lda, min_lda) << context << " invalid lda=" << lda << " for transA=" << CublasOperationName(trans_a)
+                           << ", m=" << m << ", k=" << k;
+    CHECK_GE(ldb, min_ldb) << context << " invalid ldb=" << ldb << " for transB=" << CublasOperationName(trans_b)
+                           << ", n=" << n << ", k=" << k;
+    CHECK_GE(ldc, min_ldc) << context << " invalid ldc=" << ldc << " for output m=" << m << ", n=" << n;
+}
+
+void CheckStridedBatchedGemmArgs(const char *context, cublasOperation_t trans_a, cublasOperation_t trans_b, int64_t m,
+                                 int64_t n, int64_t k, int64_t lda, int64_t ldb, int64_t ldc, int64_t stride_a,
+                                 int64_t stride_b, int64_t stride_c, int64_t batch_count) {
+    CheckGemmArgs(context, trans_a, trans_b, m, n, k, lda, ldb, ldc);
+    CheckFitsInt(context, "batch_count", batch_count);
+    CheckNonNegativeStride(context, "strideA", stride_a);
+    CheckNonNegativeStride(context, "strideB", stride_b);
+    CheckNonNegativeStride(context, "strideC", stride_c);
+}
+
+} // namespace
 
 std::shared_ptr<Tensor> MatmulForward(const std::shared_ptr<Tensor> &input, const std::shared_ptr<Tensor> &other) {
     // =================================== 作业 ===================================
@@ -77,6 +126,9 @@ std::shared_ptr<Tensor> MatmulForward(const std::shared_ptr<Tensor> &input, cons
     const int64_t stride_other = K * N;
     const int64_t stride_input = M * K;
     const int64_t stride_output = M * N;
+
+    CheckStridedBatchedGemmArgs("MatmulForward cublasSgemmStridedBatched", CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, N, K,
+                                N, stride_other, stride_input, stride_output, batch_count);
 
     CUBLAS_CHECK(cublasSgemmStridedBatched(
         handle,
@@ -175,6 +227,9 @@ MatmulBackward(const std::shared_ptr<Tensor> &input, const std::shared_ptr<Tenso
     const int64_t stride_other = K * N;
     const int64_t stride_grad_output = M * N;
 
+    CheckStridedBatchedGemmArgs("MatmulBackward grad_input cublasSgemmStridedBatched", CUBLAS_OP_T, CUBLAS_OP_N, K,
+                                M, N, N, N, K, stride_other, stride_grad_output, stride_input, batch_count);
+
     CUBLAS_CHECK(cublasSgemmStridedBatched(
         handle,
         CUBLAS_OP_T,
@@ -195,6 +250,9 @@ MatmulBackward(const std::shared_ptr<Tensor> &input, const std::shared_ptr<Tenso
         stride_input,
         static_cast<int>(batch_count)
     ));
+
+    CheckStridedBatchedGemmArgs("MatmulBackward grad_other cublasSgemmStridedBatched", CUBLAS_OP_N, CUBLAS_OP_T, N,
+                                K, M, N, K, N, stride_grad_output, stride_input, stride_other, batch_count);
 
     CUBLAS_CHECK(cublasSgemmStridedBatched(
         handle,
@@ -271,6 +329,7 @@ std::shared_ptr<Tensor> LinearForward(const std::shared_ptr<Tensor> &input, cons
         int num_blocks = (bs * out_features + threads_per_block - 1) / threads_per_block;
         BiasCopyKernel<<<num_blocks, threads_per_block>>>(
             static_cast<float *>(output->DataPtr()), static_cast<const float *>(bias->DataPtr()), bs, out_features);
+        CUDA_KERNEL_CHECK();
     } else {
         output->Fill<float>(0.0f);
     }
@@ -286,6 +345,8 @@ std::shared_ptr<Tensor> LinearForward(const std::shared_ptr<Tensor> &input, cons
         // C = output.T[out_features, bs]
         // A = weight.T[in_features, out_features]
         // B = input.T[in_features, bs]
+        CheckGemmArgs("LinearForward transpose cublasSgemm", CUBLAS_OP_T, CUBLAS_OP_N, out_features, bs,
+                      in_features, in_features, in_features, out_features);
         CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, out_features, bs, in_features, &alpha,
                                  static_cast<const float *>(weight->DataPtr()), in_features,
                                  static_cast<const float *>(input->DataPtr()), in_features, &beta,
@@ -295,6 +356,8 @@ std::shared_ptr<Tensor> LinearForward(const std::shared_ptr<Tensor> &input, cons
         // C = output.T[out_features, bs]
         // A = weight.T[out_features, in_features]
         // B = input.T[in_features, bs]
+        CheckGemmArgs("LinearForward cublasSgemm", CUBLAS_OP_N, CUBLAS_OP_N, out_features, bs, in_features,
+                      out_features, in_features, out_features);
         CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, out_features, bs, in_features, &alpha,
                                  static_cast<const float *>(weight->DataPtr()), out_features,
                                  static_cast<const float *>(input->DataPtr()), in_features, &beta,
@@ -358,6 +421,8 @@ LinearBackward(const std::shared_ptr<Tensor> &input, const std::shared_ptr<Tenso
         // C = d_input.T[in_features, bs]
         // A = weight.T[in_features, out_features]
         // B = d_output.T[out_features, bs]
+        CheckGemmArgs("LinearBackward transpose grad_input cublasSgemm", CUBLAS_OP_N, CUBLAS_OP_N, in_features, bs,
+                      out_features, in_features, out_features, in_features);
         CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, in_features, bs, out_features, &alpha,
                                  static_cast<const float *>(weight->DataPtr()), in_features,
                                  static_cast<const float *>(grad_output->DataPtr()), out_features, &beta,
@@ -367,6 +432,8 @@ LinearBackward(const std::shared_ptr<Tensor> &input, const std::shared_ptr<Tenso
         // C = d_weight.T[in_features, out_features]
         // A = input.T[in_features, bs]
         // B = d_output.T[out_features, bs]
+        CheckGemmArgs("LinearBackward transpose grad_weight cublasSgemm", CUBLAS_OP_N, CUBLAS_OP_T, in_features,
+                      out_features, bs, in_features, out_features, in_features);
         CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T, in_features, out_features, bs, &alpha,
                                  static_cast<const float *>(input->DataPtr()), in_features,
                                  static_cast<const float *>(grad_output->DataPtr()), out_features, &beta,
@@ -378,6 +445,8 @@ LinearBackward(const std::shared_ptr<Tensor> &input, const std::shared_ptr<Tenso
         // C = d_input.T[in_features, bs]
         // A = weight.T[out_features, in_features]
         // B = d_output.T[out_features, bs]
+        CheckGemmArgs("LinearBackward grad_input cublasSgemm", CUBLAS_OP_T, CUBLAS_OP_N, in_features, bs,
+                      out_features, out_features, out_features, in_features);
         CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, in_features, bs, out_features, &alpha,
                                  static_cast<const float *>(weight->DataPtr()), out_features,
                                  static_cast<const float *>(grad_output->DataPtr()), out_features, &beta,
@@ -387,6 +456,8 @@ LinearBackward(const std::shared_ptr<Tensor> &input, const std::shared_ptr<Tenso
         // C = d_weight.T[out_features, in_features]
         // A = d_output.T[out_features, bs]
         // B = input.T[in_features, bs]
+        CheckGemmArgs("LinearBackward grad_weight cublasSgemm", CUBLAS_OP_N, CUBLAS_OP_T, out_features, in_features,
+                      bs, out_features, in_features, out_features);
         CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T, out_features, in_features, bs, &alpha,
                                  static_cast<const float *>(grad_output->DataPtr()), out_features,
                                  static_cast<const float *>(input->DataPtr()), in_features, &beta,
@@ -401,6 +472,7 @@ LinearBackward(const std::shared_ptr<Tensor> &input, const std::shared_ptr<Tenso
         ReduceColumnsKernel<BLOCK_SIZE>
             <<<num_blocks, threads_per_block>>>(static_cast<const float *>(grad_output->DataPtr()),
                                                 static_cast<float *>(grad_bias->DataPtr()), out_features, bs);
+        CUDA_KERNEL_CHECK();
     }
 
     CUBLAS_CHECK(cublasDestroy(handle));

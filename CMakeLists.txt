@@ -1,6 +1,8 @@
 option(USE_CUDA "Support NVIDIA CUDA" OFF)
 option(BUILD_TEST "Build tests" OFF)
 option(BUILD_TESTING "third party tests" OFF)
+option(TINY_ENABLE_CUDA_LINEINFO "Build CUDA kernels with source line information" ON)
+option(TINY_DEBUG_CUDA_SYNC "Synchronize after CUDA kernel launches for debugging" OFF)
 
 cmake_minimum_required(VERSION 3.28)
 
@@ -49,6 +51,12 @@ if(USE_CUDA)
     file(GLOB_RECURSE CUDA_KERNELS ${PROJECT_SOURCE_DIR}/infini_train/src/*.cu)
     add_library(infini_train_cuda_kernels STATIC ${CUDA_KERNELS})
     set_target_properties(infini_train_cuda_kernels PROPERTIES CUDA_ARCHITECTURES "75;80")
+    if(TINY_ENABLE_CUDA_LINEINFO)
+        target_compile_options(infini_train_cuda_kernels PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
+    endif()
+    if(TINY_DEBUG_CUDA_SYNC)
+        target_compile_definitions(infini_train_cuda_kernels PRIVATE TINY_DEBUG_CUDA_SYNC=1)
+    endif()
     target_link_libraries(infini_train_cuda_kernels glog CUDA::cudart CUDA::cublas)
 
     add_library(infini_train STATIC ${SRC})

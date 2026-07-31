@@ -1,4 +1,6 @@
+#include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <format>
 #include <memory>
@@ -198,6 +200,46 @@ protected:
     int freq_generate_txt = 10;
     float learning_rate = 1e-4;
 };
+
+TEST_F(GPT2TrainingTest, SingleStepDiagnostics) {
+    auto train_iter = train_loader->begin();
+
+    optimizer->ZeroGrad();
+
+    auto [x, y] = *train_iter;
+    x = std::make_shared<Tensor>(x->To(device));
+    y = std::make_shared<Tensor>(y->To(device));
+
+    auto outputs = model->Forward({x, y});
+    logits = outputs[0];
+
+    ASSERT_NE(logits, nullptr) << "First output is null";
+    ASSERT_GT(logits->NumElements(), 0) << "Empty logits tensor";
+    ASSERT_EQ(logits->Dims().size(), 3) << "Logits should be 3D (batch, seq, vocab)";
+    ASSERT_NE(loss_fn, nullptr) << "Loss function not initialized!";
+
+    auto loss = loss_fn->Forward({logits, y})[0];
+    ASSERT_NE(loss, nullptr) << "Loss output is null";
+
+    auto loss_cpu = loss->To(Device());
+    const float loss_value = static_cast<const float *>(loss_cpu.DataPtr())[0];
+
+    loss->Backward();
+    optimizer->Step();
+
+    EXPECT_TRUE(std::isfinite(loss_value)) << "Loss is not finite: " << loss_value;
+
+    auto logits_cpu = logits->To(Device(DeviceType::kCPU, 0));
+    const float *logits_data = static_cast<const float *>(logits_cpu.DataPtr());
+    const size_t num_elements = logits->NumElements();
+    const size_t checked_samples = std::min(static_cast<size_t>(16), num_elements);
+
+    for (size_t i = 0; i < checked_samples; ++i) {
+        const size_t idx = i * num_elements / checked_samples;
+        EXPECT_TRUE(std::isfinite(logits_data[idx])) << "Logit sample is not finite at position " << idx
+                                                     << ": " << logits_data[idx];
+    }
+}
 
 TEST_F(GPT2TrainingTest, LogitsConsistency) {
     const auto tokens_per_fwdbwd = batch_size * sequence_length;    // 梯度累积步数
