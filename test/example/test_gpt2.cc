@@ -24,9 +24,12 @@
 #include <sstream>
 #include <stdexcept>
 #include <system_error>
+#include <tuple>
 #include <vector>
 #include <gtest/gtest.h>
 
+#include "infini_train/include/autograd/function.h"
+#include "infini_train/include/dispatcher.h"
 #include "infini_train/include/nn/modules/loss.h"
 #include "infini_train/include/dataloader.h"
 #include "infini_train/include/device.h"
@@ -1120,6 +1123,8 @@ struct TensorComparisonMetrics {
     size_t rhs_nan_count = 0;
     size_t lhs_inf_count = 0;
     size_t rhs_inf_count = 0;
+    size_t lhs_nonzero_count = 0;
+    size_t rhs_nonzero_count = 0;
     std::vector<RowDiffMetrics> row_metrics;
 };
 
@@ -1210,6 +1215,8 @@ TensorComparisonMetrics CompareFloatData(const std::vector<int64_t> &dims, const
         metrics.rhs_nan_count += std::isnan(rhs_value) ? 1 : 0;
         metrics.lhs_inf_count += std::isinf(lhs_value) ? 1 : 0;
         metrics.rhs_inf_count += std::isinf(rhs_value) ? 1 : 0;
+        metrics.lhs_nonzero_count += lhs_value != 0.0f ? 1 : 0;
+        metrics.rhs_nonzero_count += rhs_value != 0.0f ? 1 : 0;
 
         const bool nonfinite = !std::isfinite(lhs_value) || !std::isfinite(rhs_value);
         const double diff = nonfinite ? std::numeric_limits<double>::infinity()
@@ -1387,7 +1394,9 @@ void LogTensorDiffComparison(const std::string &label, const TensorComparisonMet
               << " lhs_nan_count=" << metrics.lhs_nan_count
               << " rhs_nan_count=" << metrics.rhs_nan_count
               << " lhs_inf_count=" << metrics.lhs_inf_count
-              << " rhs_inf_count=" << metrics.rhs_inf_count;
+              << " rhs_inf_count=" << metrics.rhs_inf_count
+              << " lhs_nonzero_count=" << metrics.lhs_nonzero_count
+              << " rhs_nonzero_count=" << metrics.rhs_nonzero_count;
     if (!metrics.row_metrics.empty()) {
         const auto max_row = BestRowByMaxAbs(metrics);
         const auto count_row = BestRowByCount(metrics);
@@ -2163,6 +2172,372 @@ protected:
     }
 
 
+    struct BackwardContributionSnapshot {
+        std::string event;
+        std::string source;
+        LogitsBinary tensor;
+    };
+
+    class ScopedBackwardDiagnosticsObserver final {
+    public:
+        explicit ScopedBackwardDiagnosticsObserver(autograd::BackwardDiagnosticsObserver *observer) {
+            previous_ = autograd::GetBackwardDiagnosticsObserver();
+            autograd::SetBackwardDiagnosticsObserver(observer);
+        }
+
+        ~ScopedBackwardDiagnosticsObserver() {
+            autograd::SetBackwardDiagnosticsObserver(previous_);
+        }
+
+    private:
+        autograd::BackwardDiagnosticsObserver *previous_ = nullptr;
+    };
+
+    class SharedWeightBackwardObserver final : public autograd::BackwardDiagnosticsObserver {
+    public:
+        SharedWeightBackwardObserver(int run_id, const Tensor &shared_weight, const Tensor &shared_grad)
+            : run_id_(run_id), shared_weight_data_(shared_weight.DataPtr()), shared_grad_data_(shared_grad.DataPtr()) {}
+
+        void OnBackwardStart(const Tensor &root) override {
+            (void)root;
+            CHECK(shared_grad_tensor_ != nullptr);
+            Capture("backward_start_shared_grad", "shared_grad", *shared_grad_tensor_);
+        }
+
+        void OnContributionProduced(const std::string &source, const Tensor *owner, const Tensor &contribution) override {
+            if (owner == nullptr || owner->DataPtr() != shared_weight_data_) {
+                return;
+            }
+            Capture(source + "_contribution_produced", source, contribution);
+        }
+
+        void OnAccumulateBefore(const autograd::BackwardContributionInfo &info, const Tensor &grad_buffer,
+                                const Tensor &contribution) override {
+            (void)contribution;
+            if (grad_buffer.DataPtr() != shared_grad_data_) {
+                return;
+            }
+            Capture("accumulate_before_" + info.source, info.source, grad_buffer);
+        }
+
+        void OnAccumulateAfter(const autograd::BackwardContributionInfo &info, const Tensor &grad_buffer,
+                               const Tensor &contribution) override {
+            (void)contribution;
+            if (grad_buffer.DataPtr() != shared_grad_data_) {
+                return;
+            }
+            Capture("accumulate_after_" + info.source, info.source, grad_buffer);
+        }
+
+        void OnBackwardEnd(const Tensor &root) override {
+            (void)root;
+            CHECK(shared_grad_tensor_ != nullptr);
+            Capture("backward_end_shared_grad", "shared_grad", *shared_grad_tensor_);
+        }
+
+        void SetSharedGradTensor(const Tensor &shared_grad) {
+            shared_grad_tensor_ = &shared_grad;
+        }
+
+        const std::vector<BackwardContributionSnapshot> &snapshots() const { return snapshots_; }
+
+    private:
+        void Capture(const std::string &event, const std::string &source, const Tensor &tensor) {
+            auto payload = CopyTensorToLogitsBinary(const_cast<Tensor &>(tensor));
+            const size_t nonzero_count = std::count_if(payload.data.begin(), payload.data.end(),
+                                                       [](float value) { return value != 0.0f; });
+            LOG(INFO) << "BACKWARD_CONTRIB_SNAPSHOT run=" << run_id_
+                      << " event=" << event
+                      << " source=" << source
+                      << " dims=" << DimsToString(payload.dims)
+                      << " elements=" << payload.data.size()
+                      << " nonzero_count=" << nonzero_count;
+            snapshots_.push_back({.event = event, .source = source, .tensor = std::move(payload)});
+        }
+
+        int run_id_ = 0;
+        const void *shared_weight_data_ = nullptr;
+        const void *shared_grad_data_ = nullptr;
+        const Tensor *shared_grad_tensor_ = nullptr;
+        std::vector<BackwardContributionSnapshot> snapshots_;
+    };
+
+    std::shared_ptr<Tensor> SharedLmHeadWeight(PairedTrainingRun &run) {
+        auto state_dict = run.model->StateDict();
+        const auto it = state_dict.find("lm_head.weight");
+        CHECK(it != state_dict.end());
+        return it->second;
+    }
+
+    std::vector<BackwardContributionSnapshot> RunBackwardWithSharedWeightObserver(PairedTrainingRun &run,
+                                                                                  Tensor &loss) {
+        auto shared_weight = SharedLmHeadWeight(run);
+        auto shared_grad = shared_weight->grad();
+        CHECK(shared_grad != nullptr) << "shared lm_head.weight grad must exist after optimizer->ZeroGrad()";
+        SharedWeightBackwardObserver observer(run.run_id, *shared_weight, *shared_grad);
+        observer.SetSharedGradTensor(*shared_grad);
+        {
+            ScopedBackwardDiagnosticsObserver scoped(&observer);
+            loss.Backward();
+        }
+        return observer.snapshots();
+    }
+
+    TensorComparisonMetrics CompareLogitsPayloads(const LogitsBinary &lhs, const LogitsBinary &rhs,
+                                                  float tolerance) {
+        CHECK(lhs.dims == rhs.dims) << "lhs dims=" << DimsToString(lhs.dims)
+                                    << " rhs dims=" << DimsToString(rhs.dims);
+        CHECK_EQ(lhs.data.size(), rhs.data.size());
+        return CompareFloatData(lhs.dims, lhs.data.data(), rhs.data.data(), lhs.data.size(), tolerance);
+    }
+
+    void CompareBackwardContributionSnapshots(const std::string &stage,
+                                              const std::vector<BackwardContributionSnapshot> &lhs,
+                                              const std::vector<BackwardContributionSnapshot> &rhs,
+                                              FirstDivergenceTracker &tracker, int update, int micro) {
+        LOG(INFO) << "BACKWARD_CONTRIB_COMPARE stage=" << stage
+                  << " lhs_events=" << lhs.size()
+                  << " rhs_events=" << rhs.size();
+        ASSERT_EQ(lhs.size(), rhs.size()) << stage;
+        for (size_t i = 0; i < lhs.size(); ++i) {
+            EXPECT_EQ(lhs[i].event, rhs[i].event) << stage << " event index " << i;
+            EXPECT_EQ(lhs[i].source, rhs[i].source) << stage << " event index " << i;
+            const auto metrics = CompareLogitsPayloads(lhs[i].tensor, rhs[i].tensor, kDiagnosticTolerance);
+            EXPECT_FALSE(TensorHasNonFiniteDiffInput(metrics)) << stage << " " << lhs[i].event;
+            const std::string label = stage + "." + std::to_string(i) + "." + lhs[i].event;
+            LogTensorDiffComparison(label, metrics, kDiagnosticTolerance);
+            tracker.ObserveTensor(update, micro, stage, lhs[i].event, metrics);
+            LOG(INFO) << "BACKWARD_CONTRIB_EVENT_COMPARE stage=" << stage
+                      << " index=" << i
+                      << " event=" << lhs[i].event
+                      << " source=" << lhs[i].source
+                      << " bitwise_equal=" << (metrics.count_bitwise_mismatch == 0)
+                      << " max_abs=" << metrics.max_abs
+                      << " mean_abs=" << metrics.mean_abs
+                      << " rmse=" << metrics.rmse
+                      << " first_mismatch=" << OptionalIndexString(metrics.has_bitwise_mismatch, metrics.first_mismatch)
+                      << " lhs_nonzero_count=" << metrics.lhs_nonzero_count
+                      << " rhs_nonzero_count=" << metrics.rhs_nonzero_count;
+        }
+    }
+
+    std::shared_ptr<Tensor> MakeDeterministicFloatTensor(const std::vector<int64_t> &dims, float scale,
+                                                         int offset) {
+        auto tensor = std::make_shared<Tensor>(dims, DataType::kFLOAT32, Device(DeviceType::kCPU, 0));
+        auto *data = static_cast<float *>(tensor->DataPtr());
+        for (size_t i = 0; i < tensor->NumElements(); ++i) {
+            const int value = static_cast<int>((i * 1103515245ULL + static_cast<size_t>(offset) * 12345ULL) % 4096ULL);
+            data[i] = (static_cast<float>(value) - 2048.0f) * scale;
+        }
+        return tensor;
+    }
+
+    std::shared_ptr<Tensor> MakeDeterministicTokenTensor(const std::vector<int64_t> &dims, int64_t vocab_size) {
+        auto tensor = std::make_shared<Tensor>(dims, DataType::kINT64, Device(DeviceType::kCPU, 0));
+        auto *data = static_cast<int64_t *>(tensor->DataPtr());
+        for (size_t i = 0; i < tensor->NumElements(); ++i) {
+            data[i] = static_cast<int64_t>((i * 17 + (i % 5) * 3) % 32);
+            CHECK_LT(data[i], vocab_size);
+        }
+        return tensor;
+    }
+
+    std::shared_ptr<Tensor> ToDiagnosticCudaTensor(const std::shared_ptr<Tensor> &cpu_tensor) {
+        return std::make_shared<Tensor>(cpu_tensor->To(device));
+    }
+
+    void LogRepeatedTensorResults(const std::string &label, const std::vector<LogitsBinary> &results) {
+        ASSERT_GE(results.size(), 2);
+        int first_diff_iter = -1;
+        double max_abs = 0.0;
+        for (size_t i = 1; i < results.size(); ++i) {
+            const auto metrics = CompareLogitsPayloads(results[0], results[i], 0.0f);
+            EXPECT_FALSE(TensorHasNonFiniteDiffInput(metrics)) << label << " iteration " << i;
+            if (metrics.count_bitwise_mismatch != 0 && first_diff_iter < 0) {
+                first_diff_iter = static_cast<int>(i);
+            }
+            max_abs = std::max(max_abs, metrics.max_abs);
+            LogTensorDiffComparison(label + ".iter" + std::to_string(i), metrics, 0.0f);
+        }
+        LOG(INFO) << "DETERMINISM_RESULT label=" << label
+                  << " runs=" << results.size()
+                  << " bitwise_stable=" << (first_diff_iter < 0)
+                  << " first_diff_iter=" << first_diff_iter
+                  << " max_abs=" << max_abs;
+    }
+
+    void LogMatrixRowDiffSummary(const std::string &label, const LogitsBinary &lhs, const LogitsBinary &rhs,
+                                 float tolerance) {
+        if (lhs.dims.size() != 2 || lhs.dims != rhs.dims) {
+            return;
+        }
+        const size_t rows = static_cast<size_t>(lhs.dims[0]);
+        const size_t cols = static_cast<size_t>(lhs.dims[1]);
+        size_t best_row = 0;
+        double best_max_abs = -1.0;
+        double best_mean_abs = 0.0;
+        double best_rmse = 0.0;
+        size_t best_count_gt = 0;
+        bool has_first_mismatch = false;
+        size_t first_mismatch_row = 0;
+        size_t first_mismatch_col = 0;
+        for (size_t row = 0; row < rows; ++row) {
+            double sum_abs = 0.0;
+            double sum_sq = 0.0;
+            double row_max_abs = 0.0;
+            size_t row_count_gt = 0;
+            for (size_t col = 0; col < cols; ++col) {
+                const size_t index = row * cols + col;
+                const float lhs_value = lhs.data[index];
+                const float rhs_value = rhs.data[index];
+                const bool nonfinite = !std::isfinite(lhs_value) || !std::isfinite(rhs_value);
+                const double diff = nonfinite ? std::numeric_limits<double>::infinity()
+                                              : std::abs(static_cast<double>(lhs_value) - static_cast<double>(rhs_value));
+                if (!has_first_mismatch && std::memcmp(&lhs_value, &rhs_value, sizeof(float)) != 0) {
+                    has_first_mismatch = true;
+                    first_mismatch_row = row;
+                    first_mismatch_col = col;
+                }
+                if (nonfinite || diff > tolerance) {
+                    ++row_count_gt;
+                }
+                sum_abs += diff;
+                sum_sq += diff * diff;
+                row_max_abs = std::max(row_max_abs, diff);
+            }
+            if (row_max_abs > best_max_abs || (row_max_abs == best_max_abs && row_count_gt > best_count_gt)) {
+                best_row = row;
+                best_max_abs = row_max_abs;
+                best_mean_abs = sum_abs / static_cast<double>(cols);
+                best_rmse = std::sqrt(sum_sq / static_cast<double>(cols));
+                best_count_gt = row_count_gt;
+            }
+        }
+        LOG(INFO) << "MATRIX_ROW_AUTO label=" << label
+                  << " kind=max_abs row=" << best_row
+                  << " max_abs=" << best_max_abs
+                  << " mean_abs=" << best_mean_abs
+                  << " rmse=" << best_rmse
+                  << " count_gt_tolerance=" << best_count_gt;
+        LOG(INFO) << "MATRIX_ROW_AUTO label=" << label
+                  << " kind=first_mismatch row="
+                  << (has_first_mismatch ? std::to_string(first_mismatch_row) : std::string("none"))
+                  << " col=" << (has_first_mismatch ? std::to_string(first_mismatch_col) : std::string("none"));
+    }
+
+    template <typename RunOnceT>
+    void LogRepeatedTensorResultsIncremental(const std::string &label, int runs, RunOnceT run_once) {
+        ASSERT_GE(runs, 2);
+        auto reference = run_once();
+        int first_diff_iter = -1;
+        double max_abs = 0.0;
+        for (int i = 1; i < runs; ++i) {
+            auto current = run_once();
+            const auto metrics = CompareLogitsPayloads(reference, current, 0.0f);
+            EXPECT_FALSE(TensorHasNonFiniteDiffInput(metrics)) << label << " iteration " << i;
+            if (metrics.count_bitwise_mismatch != 0 && first_diff_iter < 0) {
+                first_diff_iter = i;
+            }
+            max_abs = std::max(max_abs, metrics.max_abs);
+            const std::string iter_label = label + ".iter" + std::to_string(i);
+            LogTensorDiffComparison(iter_label, metrics, 0.0f);
+            LogMatrixRowDiffSummary(iter_label, reference, current, 0.0f);
+        }
+        LOG(INFO) << "DETERMINISM_RESULT label=" << label
+                  << " runs=" << runs
+                  << " bitwise_stable=" << (first_diff_iter < 0)
+                  << " first_diff_iter=" << first_diff_iter
+                  << " max_abs=" << max_abs;
+    }
+
+    void ReleaseFixtureTrainingStateForStandaloneKernelTest() {
+        logits.reset();
+        optimizer.reset();
+        loss_fn.reset();
+        model.reset();
+        tokenizer.reset();
+        train_loader.reset();
+    }
+    LogitsBinary RunLinearWeightGradientOnce(const LogitsBinary &input_cpu_payload,
+                                             const LogitsBinary &weight_cpu_payload,
+                                             const LogitsBinary &grad_output_cpu_payload,
+                                             const LogitsBinary &initial_grad_cpu_payload) {
+        auto input_cpu = std::make_shared<Tensor>(input_cpu_payload.dims, DataType::kFLOAT32, Device(DeviceType::kCPU, 0));
+        std::memcpy(input_cpu->DataPtr(), input_cpu_payload.data.data(), input_cpu_payload.data.size() * sizeof(float));
+        auto weight_cpu = std::make_shared<Tensor>(weight_cpu_payload.dims, DataType::kFLOAT32, Device(DeviceType::kCPU, 0));
+        std::memcpy(weight_cpu->DataPtr(), weight_cpu_payload.data.data(), weight_cpu_payload.data.size() * sizeof(float));
+        auto grad_output_cpu = std::make_shared<Tensor>(grad_output_cpu_payload.dims, DataType::kFLOAT32,
+                                                        Device(DeviceType::kCPU, 0));
+        std::memcpy(grad_output_cpu->DataPtr(), grad_output_cpu_payload.data.data(),
+                    grad_output_cpu_payload.data.size() * sizeof(float));
+        auto initial_grad_cpu = std::make_shared<Tensor>(initial_grad_cpu_payload.dims, DataType::kFLOAT32,
+                                                         Device(DeviceType::kCPU, 0));
+        std::memcpy(initial_grad_cpu->DataPtr(), initial_grad_cpu_payload.data.data(),
+                    initial_grad_cpu_payload.data.size() * sizeof(float));
+
+        auto input = ToDiagnosticCudaTensor(input_cpu);
+        auto weight = ToDiagnosticCudaTensor(weight_cpu);
+        auto grad_output = ToDiagnosticCudaTensor(grad_output_cpu);
+        auto grad_buffer = ToDiagnosticCudaTensor(initial_grad_cpu);
+        const auto &linear_backward = Dispatcher::Instance().GetKernel({DeviceType::kCUDA, "LinearBackward"});
+        auto gradients = linear_backward.Call<std::tuple<std::shared_ptr<Tensor>, std::shared_ptr<Tensor>, std::shared_ptr<Tensor>>>(
+            input, weight, true, 50257, grad_output, false);
+        auto grad_weight = std::get<1>(gradients);
+        const auto &accumulate_grad = Dispatcher::Instance().GetKernel({DeviceType::kCUDA, "AccumulateGrad"});
+        accumulate_grad.Call<void>(grad_weight, 1.0f, grad_buffer);
+        return CopyTensorToLogitsBinary(*grad_buffer);
+    }
+
+    LogitsBinary RunEmbeddingWeightGradientOnce(const std::vector<int64_t> &input_dims,
+                                                const std::vector<int64_t> &input_values,
+                                                const LogitsBinary &grad_output_cpu_payload) {
+        auto input_cpu = std::make_shared<Tensor>(input_dims, DataType::kINT64, Device(DeviceType::kCPU, 0));
+        std::memcpy(input_cpu->DataPtr(), input_values.data(), input_values.size() * sizeof(int64_t));
+        auto grad_output_cpu = std::make_shared<Tensor>(grad_output_cpu_payload.dims, DataType::kFLOAT32,
+                                                        Device(DeviceType::kCPU, 0));
+        std::memcpy(grad_output_cpu->DataPtr(), grad_output_cpu_payload.data.data(),
+                    grad_output_cpu_payload.data.size() * sizeof(float));
+        auto input = ToDiagnosticCudaTensor(input_cpu);
+        auto grad_output = ToDiagnosticCudaTensor(grad_output_cpu);
+        const auto &embedding_backward = Dispatcher::Instance().GetKernel({DeviceType::kCUDA, "EmbeddingBackward"});
+        auto grad_weight = embedding_backward.Call<std::shared_ptr<Tensor>>(input, std::vector<int64_t>{50257, 768},
+                                                                            grad_output);
+        return CopyTensorToLogitsBinary(*grad_weight);
+    }
+
+    LogitsBinary RunSharedAccumulationOnce(const LogitsBinary &initial_grad_cpu_payload,
+                                           const LogitsBinary &contribution_a_cpu_payload,
+                                           const LogitsBinary &contribution_b_cpu_payload,
+                                           const std::string &order) {
+        auto initial_grad_cpu = std::make_shared<Tensor>(initial_grad_cpu_payload.dims, DataType::kFLOAT32,
+                                                         Device(DeviceType::kCPU, 0));
+        std::memcpy(initial_grad_cpu->DataPtr(), initial_grad_cpu_payload.data.data(),
+                    initial_grad_cpu_payload.data.size() * sizeof(float));
+        auto contribution_a_cpu = std::make_shared<Tensor>(contribution_a_cpu_payload.dims, DataType::kFLOAT32,
+                                                           Device(DeviceType::kCPU, 0));
+        std::memcpy(contribution_a_cpu->DataPtr(), contribution_a_cpu_payload.data.data(),
+                    contribution_a_cpu_payload.data.size() * sizeof(float));
+        auto contribution_b_cpu = std::make_shared<Tensor>(contribution_b_cpu_payload.dims, DataType::kFLOAT32,
+                                                           Device(DeviceType::kCPU, 0));
+        std::memcpy(contribution_b_cpu->DataPtr(), contribution_b_cpu_payload.data.data(),
+                    contribution_b_cpu_payload.data.size() * sizeof(float));
+        auto grad_buffer = ToDiagnosticCudaTensor(initial_grad_cpu);
+        auto contribution_a = ToDiagnosticCudaTensor(contribution_a_cpu);
+        auto contribution_b = ToDiagnosticCudaTensor(contribution_b_cpu);
+        const auto &accumulate_grad = Dispatcher::Instance().GetKernel({DeviceType::kCUDA, "AccumulateGrad"});
+        auto add_a = [&]() { accumulate_grad.Call<void>(contribution_a, 1.0f, grad_buffer); };
+        auto add_b = [&]() { accumulate_grad.Call<void>(contribution_b, 1.0f, grad_buffer); };
+        if (order == "A_then_B") {
+            add_a();
+            add_b();
+        } else if (order == "B_then_A" || order == "real_autograd_order") {
+            add_b();
+            add_a();
+        } else {
+            CHECK(false) << "Unknown accumulation order: " << order;
+        }
+        return CopyTensorToLogitsBinary(*grad_buffer);
+    }
     void ConfigureGradAccumulation() {
         const auto tokens_per_fwdbwd = batch_size * sequence_length;
         grad_accum_steps = total_batch_size / tokens_per_fwdbwd;
@@ -2497,6 +2872,125 @@ TEST_F(GPT2TrainingTest, TrainingStageDiagnostics) {
 }
 
 
+TEST_F(GPT2TrainingTest, LinearWeightGradientDeterminism) {
+    ASSERT_TRUE(device.IsCUDA()) << "Linear weight-gradient determinism diagnostic requires CUDA";
+    ReleaseFixtureTrainingStateForStandaloneKernelTest();
+
+    constexpr int kRuns = 10;
+    constexpr int64_t kHiddenSize = 768;
+    constexpr int64_t kVocabSize = 50257;
+    const int64_t flattened_tokens = static_cast<int64_t>(batch_size * sequence_length);
+    LOG(INFO) << "LINEAR_WEIGHT_GRAD_DETERMINISM_BEGIN runs=" << kRuns
+              << " flattened_tokens=" << flattened_tokens
+              << " hidden_size=" << kHiddenSize
+              << " vocab_size=" << kVocabSize
+              << " input_shape=[" << batch_size << "x" << sequence_length << "x" << kHiddenSize << "]"
+              << " grad_output_shape=[" << batch_size << "x" << sequence_length << "x" << kVocabSize << "]"
+              << " weight_shape=[" << kVocabSize << "x" << kHiddenSize << "]"
+              << " grad_buffer_shape=[" << kVocabSize << "x" << kHiddenSize << "]"
+              << " transpose=true"
+              << " accumulation_kernel=AccumulateGrad";
+
+    auto input_cpu = MakeDeterministicFloatTensor({batch_size, sequence_length, kHiddenSize}, 1.0e-4f, 1);
+    auto weight_cpu = MakeDeterministicFloatTensor({kVocabSize, kHiddenSize}, 1.0e-5f, 2);
+    auto grad_output_cpu = MakeDeterministicFloatTensor({batch_size, sequence_length, kVocabSize}, 1.0e-6f, 3);
+    auto initial_grad_cpu = MakeDeterministicFloatTensor({kVocabSize, kHiddenSize}, 1.0e-7f, 4);
+    const auto input_payload = CopyTensorToLogitsBinary(*input_cpu);
+    const auto weight_payload = CopyTensorToLogitsBinary(*weight_cpu);
+    const auto grad_output_payload = CopyTensorToLogitsBinary(*grad_output_cpu);
+    const auto initial_grad_payload = CopyTensorToLogitsBinary(*initial_grad_cpu);
+    input_cpu.reset();
+    weight_cpu.reset();
+    grad_output_cpu.reset();
+    initial_grad_cpu.reset();
+
+    LogRepeatedTensorResultsIncremental("LinearWeightGradientDeterminism.full_shape", kRuns, [&]() {
+        return RunLinearWeightGradientOnce(input_payload, weight_payload, grad_output_payload, initial_grad_payload);
+    });
+}
+
+TEST_F(GPT2TrainingTest, EmbeddingWeightGradientDeterminism) {
+    ASSERT_TRUE(device.IsCUDA()) << "Embedding weight-gradient determinism diagnostic requires CUDA";
+    ReleaseFixtureTrainingStateForStandaloneKernelTest();
+
+    constexpr int kRuns = 10;
+    constexpr int64_t kHiddenSize = 768;
+    constexpr int64_t kVocabSize = 50257;
+    const std::vector<int64_t> input_dims{batch_size, sequence_length};
+    auto input_cpu = MakeDeterministicTokenTensor(input_dims, kVocabSize);
+    const auto *input_data = static_cast<const int64_t *>(input_cpu->DataPtr());
+    std::vector<int64_t> input_values(input_data, input_data + input_cpu->NumElements());
+    std::unordered_map<int64_t, size_t> token_counts;
+    for (const int64_t token : input_values) {
+        ++token_counts[token];
+    }
+    size_t repeated_token_rows = 0;
+    size_t repeated_index_instances = 0;
+    size_t max_repeat = 0;
+    int64_t max_repeat_token = -1;
+    for (const auto &[token, count] : token_counts) {
+        if (count > 1) {
+            ++repeated_token_rows;
+            repeated_index_instances += count;
+        }
+        if (count > max_repeat) {
+            max_repeat = count;
+            max_repeat_token = token;
+        }
+    }
+
+    auto grad_output_cpu = MakeDeterministicFloatTensor({batch_size, sequence_length, kHiddenSize}, 1.0e-4f, 5);
+    const auto grad_output_payload = CopyTensorToLogitsBinary(*grad_output_cpu);
+    input_cpu.reset();
+    grad_output_cpu.reset();
+
+    LOG(INFO) << "EMBEDDING_WEIGHT_GRAD_DETERMINISM_BEGIN runs=" << kRuns
+              << " input_shape=" << DimsToString(input_dims)
+              << " weight_shape=[" << kVocabSize << "x" << kHiddenSize << "]"
+              << " grad_output_shape=[" << batch_size << "x" << sequence_length << "x" << kHiddenSize << "]"
+              << " unique_token_rows=" << token_counts.size()
+              << " repeated_token_rows=" << repeated_token_rows
+              << " repeated_index_instances=" << repeated_index_instances
+              << " max_repeat_token=" << max_repeat_token
+              << " max_repeat=" << max_repeat
+              << " kernel_uses_atomic_add=true";
+
+    LogRepeatedTensorResultsIncremental("EmbeddingWeightGradientDeterminism.full_vocab", kRuns, [&]() {
+        return RunEmbeddingWeightGradientOnce(input_dims, input_values, grad_output_payload);
+    });
+}
+
+TEST_F(GPT2TrainingTest, SharedGradientAccumulationDeterminism) {
+    ASSERT_TRUE(device.IsCUDA()) << "Shared gradient accumulation determinism diagnostic requires CUDA";
+    ReleaseFixtureTrainingStateForStandaloneKernelTest();
+
+    constexpr int kRuns = 10;
+    constexpr int64_t kHiddenSize = 768;
+    constexpr int64_t kVocabSize = 50257;
+    auto initial_grad_cpu = MakeDeterministicFloatTensor({kVocabSize, kHiddenSize}, 1.0e-7f, 6);
+    auto contribution_a_cpu = MakeDeterministicFloatTensor({kVocabSize, kHiddenSize}, 1.0e-6f, 7);
+    auto contribution_b_cpu = MakeDeterministicFloatTensor({kVocabSize, kHiddenSize}, 1.0e-6f, 8);
+    const auto initial_grad_payload = CopyTensorToLogitsBinary(*initial_grad_cpu);
+    const auto contribution_a_payload = CopyTensorToLogitsBinary(*contribution_a_cpu);
+    const auto contribution_b_payload = CopyTensorToLogitsBinary(*contribution_b_cpu);
+    initial_grad_cpu.reset();
+    contribution_a_cpu.reset();
+    contribution_b_cpu.reset();
+
+    const std::vector<std::string> orders{"A_then_B", "B_then_A", "real_autograd_order"};
+    for (const auto &order : orders) {
+        LOG(INFO) << "SHARED_ACCUMULATION_DETERMINISM_BEGIN order=" << order
+                  << " runs=" << kRuns
+                  << " shape=[" << kVocabSize << "x" << kHiddenSize << "]"
+                  << " accumulation_kernel=AccumulateGrad"
+                  << " real_autograd_order=B_then_A";
+        LogRepeatedTensorResultsIncremental("SharedGradientAccumulationDeterminism." + order, kRuns, [&]() {
+            return RunSharedAccumulationOnce(initial_grad_payload, contribution_a_payload, contribution_b_payload,
+                                             order);
+        });
+    }
+}
+
 TEST_F(GPT2TrainingTest, TiedTrainingFirstDivergenceDiagnostics) {
     ConfigureGradAccumulation();
     ASSERT_EQ(grad_accum_steps, 2);
@@ -2562,9 +3056,11 @@ TEST_F(GPT2TrainingTest, TiedTrainingFirstDivergenceDiagnostics) {
                                                          first_divergence);
         observe_worst_logits(forward_stage, forward_metrics.logits);
 
-        forward_lhs.loss->Backward();
-        forward_rhs.loss->Backward();
+        auto lhs_backward_snapshots = RunBackwardWithSharedWeightObserver(lhs, *forward_lhs.loss);
+        auto rhs_backward_snapshots = RunBackwardWithSharedWeightObserver(rhs, *forward_rhs.loss);
         const std::string backward_stage = "update0_micro" + std::to_string(micro_step) + "_backward";
+        CompareBackwardContributionSnapshots(backward_stage + "_shared_weight_contributions", lhs_backward_snapshots,
+                                             rhs_backward_snapshots, first_divergence, 0, micro_step);
         (void)CompareAndLogAllParameters(backward_stage, 0, micro_step, *lhs.model, *rhs.model, first_divergence);
     }
 

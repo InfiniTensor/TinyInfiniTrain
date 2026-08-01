@@ -2,8 +2,10 @@
 #include "glog/logging.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cub/block/block_reduce.cuh>
 #include <limits>
+#include <string>
 
 #include "infini_train/include/cuda_check.h"
 #include "infini_train/include/dispatcher.h"
@@ -68,6 +70,55 @@ void CheckStridedBatchedGemmArgs(const char *context, cublasOperation_t trans_a,
     CheckNonNegativeStride(context, "strideA", stride_a);
     CheckNonNegativeStride(context, "strideB", stride_b);
     CheckNonNegativeStride(context, "strideC", stride_c);
+}
+
+bool EnvFlagEnabled(const char *name) {
+    const char *value = std::getenv(name);
+    return value != nullptr && std::string(value) == "1";
+}
+
+void LogCublasSgemmDiagnostics(const char *context, cublasHandle_t handle, cublasOperation_t trans_a,
+                               cublasOperation_t trans_b, int64_t m, int64_t n, int64_t k, int64_t lda, int64_t ldb,
+                               int64_t ldc, float alpha, float beta) {
+    if (!EnvFlagEnabled("TINY_LOG_CUBLAS_GEMM")) {
+        return;
+    }
+
+    cudaStream_t stream = nullptr;
+    cublasMath_t math_mode{};
+    cublasAtomicsMode_t atomics_mode{};
+    cublasPointerMode_t pointer_mode{};
+    CUBLAS_CHECK(cublasGetStream(handle, &stream));
+    CUBLAS_CHECK(cublasGetMathMode(handle, &math_mode));
+    CUBLAS_CHECK(cublasGetAtomicsMode(handle, &atomics_mode));
+    CUBLAS_CHECK(cublasGetPointerMode(handle, &pointer_mode));
+    const char *workspace_config = std::getenv("CUBLAS_WORKSPACE_CONFIG");
+
+    LOG(INFO) << "CUBLAS_GEMM_DIAG context=" << context
+              << " api=cublasSgemm"
+              << " handle=" << reinterpret_cast<const void *>(handle)
+              << " handle_created_per_call=1"
+              << " stream=" << reinterpret_cast<const void *>(stream)
+              << " default_stream=" << (stream == nullptr)
+              << " cublas_get_stream_status=success"
+              << " math_mode=" << static_cast<int>(math_mode)
+              << " atomics_mode=" << static_cast<int>(atomics_mode)
+              << " pointer_mode=" << static_cast<int>(pointer_mode)
+              << " m=" << m
+              << " n=" << n
+              << " k=" << k
+              << " trans_a=" << CublasOperationName(trans_a)
+              << " trans_b=" << CublasOperationName(trans_b)
+              << " lda=" << lda
+              << " ldb=" << ldb
+              << " ldc=" << ldc
+              << " alpha=" << alpha
+              << " beta=" << beta
+              << " data_type=float32"
+              << " compute_type=implicit_fp32_cublasSgemm"
+              << " algorithm=default_cublasSgemm_not_queryable"
+              << " workspace_config=" << (workspace_config == nullptr ? "unset" : workspace_config)
+              << " multiple_streams=not_observed_default_stream_callsite";
 }
 
 } // namespace
@@ -423,6 +474,9 @@ LinearBackward(const std::shared_ptr<Tensor> &input, const std::shared_ptr<Tenso
         // B = d_output.T[out_features, bs]
         CheckGemmArgs("LinearBackward transpose grad_input cublasSgemm", CUBLAS_OP_N, CUBLAS_OP_N, in_features, bs,
                       out_features, in_features, out_features, in_features);
+        LogCublasSgemmDiagnostics("LinearBackward transpose grad_input cublasSgemm", handle, CUBLAS_OP_N,
+                                  CUBLAS_OP_N, in_features, bs, out_features, in_features, out_features, in_features,
+                                  alpha, beta);
         CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, in_features, bs, out_features, &alpha,
                                  static_cast<const float *>(weight->DataPtr()), in_features,
                                  static_cast<const float *>(grad_output->DataPtr()), out_features, &beta,
@@ -434,6 +488,9 @@ LinearBackward(const std::shared_ptr<Tensor> &input, const std::shared_ptr<Tenso
         // B = d_output.T[out_features, bs]
         CheckGemmArgs("LinearBackward transpose grad_weight cublasSgemm", CUBLAS_OP_N, CUBLAS_OP_T, in_features,
                       out_features, bs, in_features, out_features, in_features);
+        LogCublasSgemmDiagnostics("LinearBackward transpose grad_weight cublasSgemm", handle, CUBLAS_OP_N,
+                                  CUBLAS_OP_T, in_features, out_features, bs, in_features, out_features, in_features,
+                                  alpha, beta);
         CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T, in_features, out_features, bs, &alpha,
                                  static_cast<const float *>(input->DataPtr()), in_features,
                                  static_cast<const float *>(grad_output->DataPtr()), out_features, &beta,
@@ -447,6 +504,8 @@ LinearBackward(const std::shared_ptr<Tensor> &input, const std::shared_ptr<Tenso
         // B = d_output.T[out_features, bs]
         CheckGemmArgs("LinearBackward grad_input cublasSgemm", CUBLAS_OP_T, CUBLAS_OP_N, in_features, bs,
                       out_features, out_features, out_features, in_features);
+        LogCublasSgemmDiagnostics("LinearBackward grad_input cublasSgemm", handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                                  in_features, bs, out_features, out_features, out_features, in_features, alpha, beta);
         CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, in_features, bs, out_features, &alpha,
                                  static_cast<const float *>(weight->DataPtr()), out_features,
                                  static_cast<const float *>(grad_output->DataPtr()), out_features, &beta,
@@ -458,6 +517,8 @@ LinearBackward(const std::shared_ptr<Tensor> &input, const std::shared_ptr<Tenso
         // B = input.T[in_features, bs]
         CheckGemmArgs("LinearBackward grad_weight cublasSgemm", CUBLAS_OP_N, CUBLAS_OP_T, out_features, in_features,
                       bs, out_features, in_features, out_features);
+        LogCublasSgemmDiagnostics("LinearBackward grad_weight cublasSgemm", handle, CUBLAS_OP_N, CUBLAS_OP_T,
+                                  out_features, in_features, bs, out_features, in_features, out_features, alpha, beta);
         CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T, out_features, in_features, bs, &alpha,
                                  static_cast<const float *>(grad_output->DataPtr()), out_features,
                                  static_cast<const float *>(input->DataPtr()), in_features, &beta,

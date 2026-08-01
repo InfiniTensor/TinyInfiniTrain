@@ -20,5 +20,6 @@ public:
 
 private:
     std::vector<int64_t> weight_dims_;
+    std::shared_ptr<Tensor> weight_for_diagnostics_ = nullptr;
 };
 } // namespace infini_train::autograd

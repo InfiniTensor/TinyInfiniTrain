@@ -2,10 +2,52 @@
 
 #include "glog/logging.h"
 
+#include <string>
+#include <unordered_map>
+#include <utility>
+
 #include "infini_train/include/dispatcher.h"
 #include "infini_train/include/tensor.h"
 
 namespace infini_train::autograd {
+namespace {
+BackwardDiagnosticsObserver *g_backward_diagnostics_observer = nullptr;
+
+std::unordered_map<const Tensor *, BackwardContributionInfo> &ContributionSourceMap() {
+    static std::unordered_map<const Tensor *, BackwardContributionInfo> contribution_sources;
+    return contribution_sources;
+}
+} // namespace
+
+void SetBackwardDiagnosticsObserver(BackwardDiagnosticsObserver *observer) {
+    g_backward_diagnostics_observer = observer;
+    if (observer == nullptr) {
+        ContributionSourceMap().clear();
+    }
+}
+
+BackwardDiagnosticsObserver *GetBackwardDiagnosticsObserver() { return g_backward_diagnostics_observer; }
+
+void RegisterBackwardContributionSource(const Tensor *contribution, std::string source, const Tensor *owner) {
+    if (contribution == nullptr) {
+        return;
+    }
+    ContributionSourceMap()[contribution] = BackwardContributionInfo{.source = std::move(source), .owner = owner};
+}
+
+BackwardContributionInfo LookupBackwardContributionSource(const Tensor *contribution) {
+    const auto &sources = ContributionSourceMap();
+    const auto it = sources.find(contribution);
+    if (it == sources.end()) {
+        return {};
+    }
+    return it->second;
+}
+
+void ClearBackwardContributionSource(const Tensor *contribution) {
+    ContributionSourceMap().erase(contribution);
+}
+
 namespace {
 class AccumulateGrad final : public Function {
 public:
@@ -23,9 +65,19 @@ public:
 
     void BackwardPartial(const std::shared_ptr<Tensor> &grad_output, int) override {
         if (grad_output) {
+            auto *observer = GetBackwardDiagnosticsObserver();
+            BackwardContributionInfo contribution_info;
+            if (observer != nullptr) {
+                contribution_info = LookupBackwardContributionSource(grad_output.get());
+                observer->OnAccumulateBefore(contribution_info, *grad_, *grad_output);
+            }
             auto device = grad_->GetDevice().Type();
             auto kernel = Dispatcher::Instance().GetKernel({device, "AccumulateGrad"});
             kernel.Call<void>(grad_output, 1.0f, grad_);
+            if (observer != nullptr) {
+                observer->OnAccumulateAfter(contribution_info, *grad_, *grad_output);
+                ClearBackwardContributionSource(grad_output.get());
+            }
         }
     }
 

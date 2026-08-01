@@ -16,6 +16,7 @@
 #include "glog/logging.h"
 
 #include "infini_train/include/autograd/elementwise.h"
+#include "infini_train/include/autograd/function.h"
 #include "infini_train/include/autograd/matmul.h"
 #include "infini_train/include/autograd/misc.h"
 #include "infini_train/include/autograd/outer.h"
@@ -393,6 +394,9 @@ std::shared_ptr<Tensor> Tensor::RequiresGrad() {
 }
 
 void Tensor::Backward(std::shared_ptr<Tensor> gradient, bool retain_graph, bool create_graph) const {
+    if (auto *observer = autograd::GetBackwardDiagnosticsObserver()) {
+        observer->OnBackwardStart(*this);
+    }
     // =================================== 作业 ===================================
     // TODO：实现自动微分反向传播
     // 功能描述：1. 计算当前张量对叶子节点的梯度    2. 支持多输出场景的梯度累加
@@ -420,6 +424,9 @@ void Tensor::Backward(std::shared_ptr<Tensor> gradient, bool retain_graph, bool 
     // 非叶子节点：从产生当前 Tensor 的 Function 开始反向传播
     if (grad_fn_) {
         grad_fn_->BackwardPartial(gradient, output_idx_);
+        if (auto *observer = autograd::GetBackwardDiagnosticsObserver()) {
+            observer->OnBackwardEnd(*this);
+        }
         return;
     }
 
@@ -432,6 +439,9 @@ void Tensor::Backward(std::shared_ptr<Tensor> gradient, bool retain_graph, bool 
         Dispatcher::Instance().GetKernel({device, "AccumulateGrad"});
 
     kernel.Call<void>(gradient, 1.0f, grad_);
+    if (auto *observer = autograd::GetBackwardDiagnosticsObserver()) {
+        observer->OnBackwardEnd(*this);
+    }
 }
 
 void Tensor::ZeroGrad() {

@@ -21,6 +21,7 @@ void Embedding::SetupContext(const std::vector<std::shared_ptr<Tensor>> &input_t
     const auto &input = input_tensors[0];
     const auto &weight = input_tensors[1];
     weight_dims_ = weight->Dims();
+    weight_for_diagnostics_ = weight;
     saved_tensors_ = {input};
 }
 
@@ -32,6 +33,10 @@ std::vector<std::shared_ptr<Tensor>> Embedding::Backward(const std::vector<std::
     auto device = input->GetDevice().Type();
     auto kernel = Dispatcher::Instance().GetKernel({device, "EmbeddingBackward"});
     auto grad_weight = kernel.Call<std::shared_ptr<Tensor>>(input, weight_dims_, grad_output);
+    if (auto *observer = GetBackwardDiagnosticsObserver()) {
+        RegisterBackwardContributionSource(grad_weight.get(), "embedding_weight", weight_for_diagnostics_.get());
+        observer->OnContributionProduced("embedding_weight", weight_for_diagnostics_.get(), *grad_weight);
+    }
     return {nullptr, grad_weight};
 }
 } // namespace infini_train::autograd

@@ -38,6 +38,10 @@ std::vector<std::shared_ptr<Tensor>> Linear::Backward(const std::vector<std::sha
     auto [grad_input, grad_weight, grad_bias]
         = kernel.Call<std::tuple<std::shared_ptr<Tensor>, std::shared_ptr<Tensor>, std::shared_ptr<Tensor>>>(
             input, weight, true, out_features_, grad_output, bias_);
+    if (auto *observer = GetBackwardDiagnosticsObserver()) {
+        RegisterBackwardContributionSource(grad_weight.get(), "linear_weight", weight.get());
+        observer->OnContributionProduced("linear_weight", weight.get(), *grad_weight);
+    }
     return bias_ ? std::vector<std::shared_ptr<Tensor>>{grad_input, grad_weight, grad_bias}
                  : std::vector<std::shared_ptr<Tensor>>{grad_input, grad_weight};
     ;

@@ -1,12 +1,37 @@
 #pragma once
 
 #include <memory>
+#include <string>
 #include <utility>
 #include <vector>
 
 #include "infini_train/include/tensor.h"
 
 namespace infini_train::autograd {
+struct BackwardContributionInfo {
+    std::string source = "unknown";
+    const Tensor *owner = nullptr;
+};
+
+class BackwardDiagnosticsObserver {
+public:
+    virtual ~BackwardDiagnosticsObserver() = default;
+
+    virtual void OnBackwardStart(const Tensor &root) {}
+    virtual void OnContributionProduced(const std::string &source, const Tensor *owner, const Tensor &contribution) {}
+    virtual void OnAccumulateBefore(const BackwardContributionInfo &info, const Tensor &grad_buffer,
+                                    const Tensor &contribution) {}
+    virtual void OnAccumulateAfter(const BackwardContributionInfo &info, const Tensor &grad_buffer,
+                                   const Tensor &contribution) {}
+    virtual void OnBackwardEnd(const Tensor &root) {}
+};
+
+void SetBackwardDiagnosticsObserver(BackwardDiagnosticsObserver *observer);
+BackwardDiagnosticsObserver *GetBackwardDiagnosticsObserver();
+void RegisterBackwardContributionSource(const Tensor *contribution, std::string source, const Tensor *owner);
+BackwardContributionInfo LookupBackwardContributionSource(const Tensor *contribution);
+void ClearBackwardContributionSource(const Tensor *contribution);
+
 class Function : public std::enable_shared_from_this<Function> {
 public:
     static constexpr char kUndefinedType[] = "Undefined";
