@@ -19,6 +19,19 @@ struct GPT2Config {
     int64_t n_embd = 768;
 };
 
+struct GPT2ForwardDiagnostics {
+    bool capture_block_outputs = false;
+    std::shared_ptr<infini_train::Tensor> transformer_input = nullptr;
+    std::shared_ptr<infini_train::Tensor> final_block_output = nullptr;
+    std::shared_ptr<infini_train::Tensor> ln_f_output = nullptr;
+    std::shared_ptr<infini_train::Tensor> lm_head_input = nullptr;
+    std::shared_ptr<infini_train::Tensor> logits = nullptr;
+    std::vector<std::shared_ptr<infini_train::Tensor>> block_outputs;
+
+    void Clear();
+    void RecordBlockOutput(int64_t block_index, const std::shared_ptr<infini_train::Tensor> &output);
+};
+
 class NewGELU : public infini_train::nn::Module {
 public:
     std::vector<std::shared_ptr<infini_train::Tensor>>
@@ -68,10 +81,15 @@ public:
     static constexpr char kLn2LayerName[] = "ln_2";
     static constexpr char kMlpLayerName[] = "mlp";
 
-    explicit Block(const GPT2Config &config);
+    explicit Block(const GPT2Config &config, int64_t diagnostic_index = -1,
+                   GPT2ForwardDiagnostics **forward_diagnostics = nullptr);
 
     std::vector<std::shared_ptr<infini_train::Tensor>>
     Forward(const std::vector<std::shared_ptr<infini_train::Tensor>> &x) override;
+
+private:
+    int64_t diagnostic_index_ = -1;
+    GPT2ForwardDiagnostics **forward_diagnostics_ = nullptr;
 };
 
 class GPT2 : public infini_train::nn::Module {
@@ -95,9 +113,12 @@ public:
     std::vector<std::shared_ptr<infini_train::Tensor>>
     Forward(const std::vector<std::shared_ptr<infini_train::Tensor>> &x) override;
 
+    void SetForwardDiagnostics(GPT2ForwardDiagnostics *forward_diagnostics);
+
     static std::unique_ptr<GPT2> FromPretrained(ModelType model_type);
     static std::unique_ptr<GPT2> FromLLMC(const std::string &filepath);
 
 private:
     GPT2Config config_;
+    GPT2ForwardDiagnostics *forward_diagnostics_ = nullptr;
 };

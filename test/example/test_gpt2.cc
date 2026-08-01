@@ -1094,6 +1094,336 @@ void LogLogitsComparison(const std::string &label, const LogitsComparisonMetrics
     LogTopRows(label, metrics.row_metrics, "max_abs", vocab_size);
 }
 
+
+struct TensorComparisonMetrics {
+    std::vector<int64_t> dims;
+    size_t elements = 0;
+    bool has_bitwise_mismatch = false;
+    size_t first_mismatch = 0;
+    size_t first_mismatch_batch = 0;
+    size_t first_mismatch_sequence = 0;
+    size_t first_mismatch_feature = 0;
+    float first_lhs = 0.0f;
+    float first_rhs = 0.0f;
+    double first_mismatch_abs = 0.0;
+    size_t count_bitwise_mismatch = 0;
+    bool has_gt_tolerance = false;
+    size_t first_gt_tolerance = 0;
+    size_t first_gt_tolerance_batch = 0;
+    size_t first_gt_tolerance_sequence = 0;
+    size_t first_gt_tolerance_feature = 0;
+    double max_abs = 0.0;
+    double mean_abs = 0.0;
+    double rmse = 0.0;
+    size_t count_gt_tolerance = 0;
+    size_t lhs_nan_count = 0;
+    size_t rhs_nan_count = 0;
+    size_t lhs_inf_count = 0;
+    size_t rhs_inf_count = 0;
+    std::vector<RowDiffMetrics> row_metrics;
+};
+
+struct FirstDivergenceTracker {
+    bool found = false;
+    int update = -1;
+    int micro = -1;
+    std::string stage = "none";
+    std::string tensor = "none";
+    double max_abs = 0.0;
+    size_t first_mismatch = 0;
+
+    void ObserveTensor(int observed_update, int observed_micro, const std::string &observed_stage,
+                       const std::string &observed_tensor, const TensorComparisonMetrics &metrics) {
+        if (!found && metrics.count_bitwise_mismatch > 0) {
+            found = true;
+            update = observed_update;
+            micro = observed_micro;
+            stage = observed_stage;
+            tensor = observed_tensor;
+            max_abs = metrics.max_abs;
+            first_mismatch = metrics.first_mismatch;
+        }
+    }
+
+    void ObserveScalar(int observed_update, int observed_micro, const std::string &observed_stage,
+                       const std::string &observed_tensor, bool bitwise_mismatch, double diff) {
+        if (!found && bitwise_mismatch) {
+            found = true;
+            update = observed_update;
+            micro = observed_micro;
+            stage = observed_stage;
+            tensor = observed_tensor;
+            max_abs = diff;
+            first_mismatch = 0;
+        }
+    }
+
+    void Log() const {
+        LOG(INFO) << "FIRST_DIVERGENCE update=" << update
+                  << " micro=" << micro
+                  << " stage=" << stage
+                  << " tensor=" << tensor
+                  << " max_abs=" << max_abs
+                  << " first_mismatch=" << (found ? std::to_string(first_mismatch) : std::string("none"));
+    }
+};
+
+std::string OptionalIndexString(bool has_index, size_t index) {
+    return has_index ? std::to_string(index) : std::string("none");
+}
+
+void Decode3DIndex(const std::vector<int64_t> &dims, size_t index, size_t *batch, size_t *sequence, size_t *feature) {
+    if (dims.size() != 3) {
+        *batch = 0;
+        *sequence = 0;
+        *feature = index;
+        return;
+    }
+    const size_t sequence_length = static_cast<size_t>(dims[1]);
+    const size_t feature_size = static_cast<size_t>(dims[2]);
+    *batch = index / (sequence_length * feature_size);
+    const size_t remainder = index % (sequence_length * feature_size);
+    *sequence = remainder / feature_size;
+    *feature = remainder % feature_size;
+}
+
+TensorComparisonMetrics CompareFloatData(const std::vector<int64_t> &dims, const float *lhs, const float *rhs,
+                                         size_t elements, float tolerance) {
+    const bool has_rows = dims.size() == 3;
+    const size_t row_count = has_rows ? static_cast<size_t>(dims[0] * dims[1]) : 0;
+    const size_t feature_size = has_rows ? static_cast<size_t>(dims[2]) : 0;
+    std::vector<double> row_sum_abs(row_count, 0.0);
+    std::vector<double> row_sum_sq(row_count, 0.0);
+    std::vector<double> row_max_abs(row_count, 0.0);
+    std::vector<size_t> row_count_gt(row_count, 0);
+
+    TensorComparisonMetrics metrics;
+    metrics.dims = dims;
+    metrics.elements = elements;
+
+    double sum_abs = 0.0;
+    double sum_sq = 0.0;
+    for (size_t i = 0; i < elements; ++i) {
+        const float lhs_value = lhs[i];
+        const float rhs_value = rhs[i];
+        metrics.lhs_nan_count += std::isnan(lhs_value) ? 1 : 0;
+        metrics.rhs_nan_count += std::isnan(rhs_value) ? 1 : 0;
+        metrics.lhs_inf_count += std::isinf(lhs_value) ? 1 : 0;
+        metrics.rhs_inf_count += std::isinf(rhs_value) ? 1 : 0;
+
+        const bool nonfinite = !std::isfinite(lhs_value) || !std::isfinite(rhs_value);
+        const double diff = nonfinite ? std::numeric_limits<double>::infinity()
+                                      : std::abs(static_cast<double>(lhs_value) - static_cast<double>(rhs_value));
+        const bool bitwise_mismatch = std::memcmp(&lhs_value, &rhs_value, sizeof(float)) != 0;
+        if (bitwise_mismatch) {
+            ++metrics.count_bitwise_mismatch;
+            if (!metrics.has_bitwise_mismatch) {
+                metrics.has_bitwise_mismatch = true;
+                metrics.first_mismatch = i;
+                metrics.first_lhs = lhs_value;
+                metrics.first_rhs = rhs_value;
+                metrics.first_mismatch_abs = diff;
+                Decode3DIndex(dims, i, &metrics.first_mismatch_batch, &metrics.first_mismatch_sequence,
+                              &metrics.first_mismatch_feature);
+            }
+        }
+
+        const bool exceeds_tolerance = nonfinite || diff > tolerance;
+        if (exceeds_tolerance) {
+            ++metrics.count_gt_tolerance;
+            if (!metrics.has_gt_tolerance) {
+                metrics.has_gt_tolerance = true;
+                metrics.first_gt_tolerance = i;
+                Decode3DIndex(dims, i, &metrics.first_gt_tolerance_batch, &metrics.first_gt_tolerance_sequence,
+                              &metrics.first_gt_tolerance_feature);
+            }
+        }
+
+        metrics.max_abs = std::max(metrics.max_abs, diff);
+        sum_abs += diff;
+        sum_sq += diff * diff;
+        if (has_rows) {
+            const size_t row = i / feature_size;
+            row_sum_abs[row] += diff;
+            row_sum_sq[row] += diff * diff;
+            row_max_abs[row] = std::max(row_max_abs[row], diff);
+            if (exceeds_tolerance) {
+                ++row_count_gt[row];
+            }
+        }
+    }
+
+    if (elements > 0) {
+        metrics.mean_abs = sum_abs / static_cast<double>(elements);
+        metrics.rmse = std::sqrt(sum_sq / static_cast<double>(elements));
+    }
+
+    if (has_rows) {
+        metrics.row_metrics.reserve(row_count);
+        for (size_t row = 0; row < row_count; ++row) {
+            RowDiffMetrics row_metrics;
+            row_metrics.row_index = row;
+            row_metrics.batch = row / static_cast<size_t>(dims[1]);
+            row_metrics.sequence = row % static_cast<size_t>(dims[1]);
+            row_metrics.max_abs = row_max_abs[row];
+            row_metrics.mean_abs = row_sum_abs[row] / static_cast<double>(feature_size);
+            row_metrics.rmse = std::sqrt(row_sum_sq[row] / static_cast<double>(feature_size));
+            row_metrics.count_gt_tolerance = row_count_gt[row];
+            metrics.row_metrics.push_back(row_metrics);
+        }
+    }
+    return metrics;
+}
+
+TensorComparisonMetrics CompareFloatTensors(Tensor &lhs, Tensor &rhs, float tolerance) {
+    CHECK_EQ(static_cast<int>(lhs.Dtype()), static_cast<int>(DataType::kFLOAT32));
+    CHECK_EQ(static_cast<int>(rhs.Dtype()), static_cast<int>(DataType::kFLOAT32));
+    auto lhs_cpu = lhs.To(Device(DeviceType::kCPU, 0));
+    auto rhs_cpu = rhs.To(Device(DeviceType::kCPU, 0));
+    CHECK(lhs_cpu.Dims() == rhs_cpu.Dims()) << "lhs dims=" << DimsToString(lhs_cpu.Dims())
+                                            << " rhs dims=" << DimsToString(rhs_cpu.Dims());
+    CHECK_EQ(lhs_cpu.NumElements(), rhs_cpu.NumElements());
+    return CompareFloatData(lhs_cpu.Dims(), static_cast<const float *>(lhs_cpu.DataPtr()),
+                            static_cast<const float *>(rhs_cpu.DataPtr()), lhs_cpu.NumElements(), tolerance);
+}
+
+RowDiffMetrics BestRowByMaxAbs(const TensorComparisonMetrics &metrics) {
+    CHECK(!metrics.row_metrics.empty());
+    return *std::max_element(metrics.row_metrics.begin(), metrics.row_metrics.end(),
+                             [](const RowDiffMetrics &lhs, const RowDiffMetrics &rhs) {
+                                 if (lhs.max_abs != rhs.max_abs) {
+                                     return lhs.max_abs < rhs.max_abs;
+                                 }
+                                 return lhs.count_gt_tolerance < rhs.count_gt_tolerance;
+                             });
+}
+
+RowDiffMetrics BestRowByCount(const TensorComparisonMetrics &metrics) {
+    CHECK(!metrics.row_metrics.empty());
+    return *std::max_element(metrics.row_metrics.begin(), metrics.row_metrics.end(),
+                             [](const RowDiffMetrics &lhs, const RowDiffMetrics &rhs) {
+                                 if (lhs.count_gt_tolerance != rhs.count_gt_tolerance) {
+                                     return lhs.count_gt_tolerance < rhs.count_gt_tolerance;
+                                 }
+                                 return lhs.max_abs < rhs.max_abs;
+                             });
+}
+
+void LogTensorTopRows(const std::string &label, std::vector<RowDiffMetrics> rows, std::string_view sort_key) {
+    if (rows.empty()) {
+        return;
+    }
+    if (sort_key == "count") {
+        std::sort(rows.begin(), rows.end(), [](const RowDiffMetrics &lhs, const RowDiffMetrics &rhs) {
+            if (lhs.count_gt_tolerance != rhs.count_gt_tolerance) {
+                return lhs.count_gt_tolerance > rhs.count_gt_tolerance;
+            }
+            return lhs.max_abs > rhs.max_abs;
+        });
+    } else {
+        std::sort(rows.begin(), rows.end(), [](const RowDiffMetrics &lhs, const RowDiffMetrics &rhs) {
+            if (lhs.max_abs != rhs.max_abs) {
+                return lhs.max_abs > rhs.max_abs;
+            }
+            return lhs.count_gt_tolerance > rhs.count_gt_tolerance;
+        });
+    }
+
+    const size_t limit = std::min<size_t>(10, rows.size());
+    for (size_t rank = 0; rank < limit; ++rank) {
+        const auto &row = rows[rank];
+        LOG(INFO) << "TENSOR_ROW_TOP label=" << label
+                  << " sort=" << sort_key
+                  << " rank=" << rank
+                  << " batch=" << row.batch
+                  << " sequence=" << row.sequence
+                  << " max_abs=" << row.max_abs
+                  << " mean_abs=" << row.mean_abs
+                  << " rmse=" << row.rmse
+                  << " count_gt_tolerance=" << row.count_gt_tolerance;
+    }
+}
+
+void LogHistoricalRowProbe(const std::string &label, const TensorComparisonMetrics &metrics, size_t batch, size_t sequence) {
+    if (metrics.dims.size() != 3) {
+        return;
+    }
+    const size_t sequence_length = static_cast<size_t>(metrics.dims[1]);
+    const size_t row = batch * sequence_length + sequence;
+    if (row >= metrics.row_metrics.size()) {
+        return;
+    }
+    const auto &row_metrics = metrics.row_metrics[row];
+    LOG(INFO) << "TENSOR_ROW_PROBE label=" << label
+              << " batch=" << batch
+              << " sequence=" << sequence
+              << " max_abs=" << row_metrics.max_abs
+              << " mean_abs=" << row_metrics.mean_abs
+              << " rmse=" << row_metrics.rmse
+              << " count_gt_tolerance=" << row_metrics.count_gt_tolerance;
+}
+
+void LogTensorDiffComparison(const std::string &label, const TensorComparisonMetrics &metrics, float tolerance) {
+    LOG(INFO) << "TENSOR_COMPARE label=" << label
+              << " tolerance=" << tolerance
+              << " dims=" << DimsToString(metrics.dims)
+              << " elements=" << metrics.elements
+              << " bitwise_mismatch_count=" << metrics.count_bitwise_mismatch
+              << " first_mismatch=" << OptionalIndexString(metrics.has_bitwise_mismatch, metrics.first_mismatch)
+              << " first_mismatch_batch=" << metrics.first_mismatch_batch
+              << " first_mismatch_sequence=" << metrics.first_mismatch_sequence
+              << " first_mismatch_feature=" << metrics.first_mismatch_feature
+              << " first_lhs=" << metrics.first_lhs
+              << " first_rhs=" << metrics.first_rhs
+              << " first_mismatch_abs=" << metrics.first_mismatch_abs
+              << " max_abs=" << metrics.max_abs
+              << " mean_abs=" << metrics.mean_abs
+              << " rmse=" << metrics.rmse
+              << " count_gt_tolerance=" << metrics.count_gt_tolerance
+              << " first_gt_tolerance=" << OptionalIndexString(metrics.has_gt_tolerance, metrics.first_gt_tolerance)
+              << " first_gt_batch=" << metrics.first_gt_tolerance_batch
+              << " first_gt_sequence=" << metrics.first_gt_tolerance_sequence
+              << " first_gt_feature=" << metrics.first_gt_tolerance_feature
+              << " lhs_nan_count=" << metrics.lhs_nan_count
+              << " rhs_nan_count=" << metrics.rhs_nan_count
+              << " lhs_inf_count=" << metrics.lhs_inf_count
+              << " rhs_inf_count=" << metrics.rhs_inf_count;
+    if (!metrics.row_metrics.empty()) {
+        const auto max_row = BestRowByMaxAbs(metrics);
+        const auto count_row = BestRowByCount(metrics);
+        LOG(INFO) << "TENSOR_ROW_AUTO label=" << label
+                  << " kind=max_abs batch=" << max_row.batch
+                  << " sequence=" << max_row.sequence
+                  << " max_abs=" << max_row.max_abs
+                  << " mean_abs=" << max_row.mean_abs
+                  << " rmse=" << max_row.rmse
+                  << " count_gt_tolerance=" << max_row.count_gt_tolerance;
+        LOG(INFO) << "TENSOR_ROW_AUTO label=" << label
+                  << " kind=count_gt_tolerance batch=" << count_row.batch
+                  << " sequence=" << count_row.sequence
+                  << " max_abs=" << count_row.max_abs
+                  << " mean_abs=" << count_row.mean_abs
+                  << " rmse=" << count_row.rmse
+                  << " count_gt_tolerance=" << count_row.count_gt_tolerance;
+        if (metrics.has_bitwise_mismatch) {
+            LOG(INFO) << "TENSOR_ROW_AUTO label=" << label
+                      << " kind=first_mismatch batch=" << metrics.first_mismatch_batch
+                      << " sequence=" << metrics.first_mismatch_sequence
+                      << " feature=" << metrics.first_mismatch_feature;
+        }
+        LogTensorTopRows(label, metrics.row_metrics, "count");
+        LogTensorTopRows(label, metrics.row_metrics, "max_abs");
+        LogHistoricalRowProbe(label, metrics, 0, 45);
+        LogHistoricalRowProbe(label, metrics, 0, 60);
+        LogHistoricalRowProbe(label, metrics, 1, 35);
+    }
+}
+
+bool TensorHasNonFiniteDiffInput(const TensorComparisonMetrics &metrics) {
+    return metrics.lhs_nan_count != 0 || metrics.rhs_nan_count != 0 || metrics.lhs_inf_count != 0
+           || metrics.rhs_inf_count != 0;
+}
+
 std::string CudaRuntimeVersionString() {
 #ifdef USE_CUDA
     int version = 0;
@@ -1461,6 +1791,378 @@ protected:
     
 
 
+    struct DiagnosticMicrobatch {
+        std::shared_ptr<Tensor> x_cpu;
+        std::shared_ptr<Tensor> y_cpu;
+    };
+
+    struct DiagnosticForwardResult {
+        std::shared_ptr<Tensor> logits;
+        std::shared_ptr<Tensor> loss;
+        float loss_value = 0.0f;
+    };
+
+    struct PairedTrainingRun {
+        int run_id = 0;
+        std::unique_ptr<GPT2> model;
+        std::unique_ptr<optimizers::SGD> optimizer;
+        std::unique_ptr<nn::CrossEntropyLoss> loss_fn;
+        GPT2ForwardDiagnostics diagnostics;
+    };
+
+    struct ForwardComparisonBundle {
+        TensorComparisonMetrics final_block_output;
+        TensorComparisonMetrics ln_f_output;
+        TensorComparisonMetrics lm_head_input;
+        TensorComparisonMetrics logits;
+
+        bool BitwiseEqual() const {
+            return final_block_output.count_bitwise_mismatch == 0 && ln_f_output.count_bitwise_mismatch == 0
+                   && lm_head_input.count_bitwise_mismatch == 0 && logits.count_bitwise_mismatch == 0;
+        }
+    };
+
+    struct ParameterDiffRecord {
+        std::string name;
+        std::string dims;
+        bool grad_present_lhs = false;
+        bool grad_present_rhs = false;
+        bool grad_presence_mismatch = false;
+        bool has_grad_metrics = false;
+        TensorComparisonMetrics grad_metrics;
+        TensorComparisonMetrics param_metrics;
+    };
+
+    std::vector<DiagnosticMicrobatch> LoadDiagnosticMicrobatches(int count) {
+        std::vector<DiagnosticMicrobatch> microbatches;
+        microbatches.reserve(static_cast<size_t>(count));
+        auto train_iter = train_loader->begin();
+        for (int i = 0; i < count; ++i) {
+            auto [x, y] = *train_iter;
+            ++train_iter;
+            microbatches.push_back({.x_cpu = x, .y_cpu = y});
+            LOG(INFO) << "PAIRED_MICROBATCH index=" << i
+                      << " input_dims=" << DimsToString(x->Dims())
+                      << " target_dims=" << DimsToString(y->Dims())
+                      << " input_hash=" << HashTensorRecord("paired_input", *x)
+                      << " target_hash=" << HashTensorRecord("paired_target", *y);
+        }
+        return microbatches;
+    }
+
+    void InitializePairedTrainingRun(PairedTrainingRun &run, int run_id) {
+        run.run_id = run_id;
+        run.model = GPT2::FromLLMC(llmc_filepath);
+        run.model->To(device);
+        run.optimizer = std::make_unique<optimizers::SGD>(run.model->Parameters(), learning_rate);
+        run.loss_fn = std::make_unique<nn::CrossEntropyLoss>();
+        run.loss_fn->To(device);
+        run.diagnostics.capture_block_outputs = true;
+        run.model->SetForwardDiagnostics(&run.diagnostics);
+        LOG(INFO) << "PAIRED_RUN_INIT run=" << run_id
+                  << " device=" << (device.IsCUDA() ? "cuda" : "cpu")
+                  << " diagnostics_capture_blocks=" << run.diagnostics.capture_block_outputs;
+    }
+
+    std::shared_ptr<Tensor> TensorToRunDevice(const std::shared_ptr<Tensor> &tensor) {
+        return std::make_shared<Tensor>(tensor->To(device));
+    }
+
+    float ReadScalarTensor(Tensor &tensor) {
+        auto cpu = tensor.To(Device(DeviceType::kCPU, 0));
+        CHECK_EQ(cpu.NumElements(), 1);
+        return static_cast<const float *>(cpu.DataPtr())[0];
+    }
+
+    DiagnosticForwardResult RunDiagnosticForward(PairedTrainingRun &run, const DiagnosticMicrobatch &microbatch) {
+        auto x = TensorToRunDevice(microbatch.x_cpu);
+        auto y = TensorToRunDevice(microbatch.y_cpu);
+        auto outputs = run.model->Forward({x, y});
+        CHECK_EQ(outputs.size(), 1);
+        auto run_logits = outputs[0];
+        CHECK(run_logits != nullptr);
+        auto loss = run.loss_fn->Forward({run_logits, y})[0];
+        CHECK(loss != nullptr);
+        const float loss_value = ReadScalarTensor(*loss);
+        return {.logits = run_logits, .loss = loss, .loss_value = loss_value};
+    }
+
+    void LogLossComparison(const std::string &stage, int update, int micro, float lhs, float rhs,
+                           FirstDivergenceTracker &tracker) {
+        const bool bitwise_mismatch = std::memcmp(&lhs, &rhs, sizeof(float)) != 0;
+        const double diff = std::abs(static_cast<double>(lhs) - static_cast<double>(rhs));
+        LOG(INFO) << "LOSS_COMPARE stage=" << stage
+                  << " update=" << update
+                  << " micro=" << micro
+                  << " lhs=" << lhs
+                  << " rhs=" << rhs
+                  << " bitwise_mismatch=" << bitwise_mismatch
+                  << " max_abs=" << diff
+                  << " lhs_finite=" << std::isfinite(lhs)
+                  << " rhs_finite=" << std::isfinite(rhs);
+        EXPECT_TRUE(std::isfinite(lhs));
+        EXPECT_TRUE(std::isfinite(rhs));
+        tracker.ObserveScalar(update, micro, stage, "loss", bitwise_mismatch, diff);
+    }
+
+    TensorComparisonMetrics CompareAndLogForwardTensor(const std::string &stage, int update, int micro,
+                                                       const std::string &tensor_name,
+                                                       const std::shared_ptr<Tensor> &lhs,
+                                                       const std::shared_ptr<Tensor> &rhs,
+                                                       FirstDivergenceTracker &tracker) {
+        CHECK(lhs != nullptr) << tensor_name;
+        CHECK(rhs != nullptr) << tensor_name;
+        auto metrics = CompareFloatTensors(*lhs, *rhs, kDiagnosticTolerance);
+        const std::string label = stage + "." + tensor_name;
+        LogTensorDiffComparison(label, metrics, kDiagnosticTolerance);
+        EXPECT_FALSE(TensorHasNonFiniteDiffInput(metrics)) << label;
+        tracker.ObserveTensor(update, micro, stage, tensor_name, metrics);
+        return metrics;
+    }
+
+    void CompareBlockOutputsIfNeeded(const std::string &stage, int update, int micro,
+                                     const GPT2ForwardDiagnostics &lhs, const GPT2ForwardDiagnostics &rhs,
+                                     FirstDivergenceTracker &tracker) {
+        auto entering_metrics = CompareAndLogForwardTensor(stage, update, micro, "transformer_input", lhs.transformer_input,
+                                                           rhs.transformer_input, tracker);
+        bool entering_equal = entering_metrics.count_bitwise_mismatch == 0;
+        const size_t block_count = std::min(lhs.block_outputs.size(), rhs.block_outputs.size());
+        for (size_t block = 0; block < block_count; ++block) {
+            auto metrics = CompareAndLogForwardTensor(stage, update, micro,
+                                                      "block_" + std::to_string(block) + "_output",
+                                                      lhs.block_outputs[block], rhs.block_outputs[block], tracker);
+            const bool leaving_equal = metrics.count_bitwise_mismatch == 0;
+            LOG(INFO) << "BLOCK_COMPARE stage=" << stage
+                      << " update=" << update
+                      << " micro=" << micro
+                      << " block=" << block
+                      << " entering_equal=" << entering_equal
+                      << " leaving_equal=" << leaving_equal
+                      << " leaving_max_abs=" << metrics.max_abs
+                      << " leaving_mean_abs=" << metrics.mean_abs
+                      << " leaving_rmse=" << metrics.rmse
+                      << " leaving_count_gt_tolerance=" << metrics.count_gt_tolerance;
+            if (!leaving_equal) {
+                LOG(INFO) << "BLOCK_FIRST_DIFFERENCE stage=" << stage
+                          << " update=" << update
+                          << " micro=" << micro
+                          << " block=" << block
+                          << " entering_equal=" << entering_equal
+                          << " leaving_max_abs=" << metrics.max_abs
+                          << " leaving_mean_abs=" << metrics.mean_abs
+                          << " leaving_rmse=" << metrics.rmse;
+                break;
+            }
+            entering_equal = leaving_equal;
+        }
+        if (lhs.block_outputs.size() != rhs.block_outputs.size()) {
+            LOG(INFO) << "BLOCK_CAPTURE_SIZE_MISMATCH stage=" << stage
+                      << " lhs_blocks=" << lhs.block_outputs.size()
+                      << " rhs_blocks=" << rhs.block_outputs.size();
+        }
+    }
+
+    ForwardComparisonBundle CompareForwardDiagnostics(const std::string &stage, int update, int micro,
+                                                      const GPT2ForwardDiagnostics &lhs,
+                                                      const GPT2ForwardDiagnostics &rhs,
+                                                      FirstDivergenceTracker &tracker) {
+        ForwardComparisonBundle bundle;
+        bundle.final_block_output = CompareAndLogForwardTensor(stage, update, micro, "final_block_output",
+                                                               lhs.final_block_output, rhs.final_block_output, tracker);
+        bundle.ln_f_output = CompareAndLogForwardTensor(stage, update, micro, "ln_f_output", lhs.ln_f_output,
+                                                        rhs.ln_f_output, tracker);
+        bundle.lm_head_input = CompareAndLogForwardTensor(stage, update, micro, "lm_head_input", lhs.lm_head_input,
+                                                          rhs.lm_head_input, tracker);
+        bundle.logits = CompareAndLogForwardTensor(stage, update, micro, "logits", lhs.logits, rhs.logits, tracker);
+
+        if (bundle.lm_head_input.count_bitwise_mismatch > 0) {
+            LOG(INFO) << "LM_HEAD_INPUT_DIFFERENT stage=" << stage
+                      << " update=" << update
+                      << " micro=" << micro
+                      << " max_abs=" << bundle.lm_head_input.max_abs
+                      << " count_bitwise_mismatch=" << bundle.lm_head_input.count_bitwise_mismatch;
+            CompareBlockOutputsIfNeeded(stage, update, micro, lhs, rhs, tracker);
+        } else if (bundle.logits.count_bitwise_mismatch > 0) {
+            LOG(INFO) << "LM_HEAD_INTERNAL_OR_OUTPUT_DIFFERENCE stage=" << stage
+                      << " update=" << update
+                      << " micro=" << micro
+                      << " logits_max_abs=" << bundle.logits.max_abs;
+        }
+        return bundle;
+    }
+
+    std::vector<std::string>
+    SortedParameterNames(const std::unordered_map<std::string, std::shared_ptr<Tensor>> &state_dict) {
+        std::vector<std::string> names;
+        names.reserve(state_dict.size());
+        for (const auto &[name, _] : state_dict) {
+            names.push_back(name);
+        }
+        std::sort(names.begin(), names.end());
+        return names;
+    }
+
+    void LogParameterDiffSummary(const std::string &stage, const std::vector<ParameterDiffRecord> &records) {
+        std::string first_grad_diff = "none";
+        std::string first_param_diff = "none";
+        for (const auto &record : records) {
+            if (first_grad_diff == "none"
+                && (record.grad_presence_mismatch
+                    || (record.has_grad_metrics
+                        && (record.grad_metrics.max_abs > 0.0 || record.grad_metrics.count_bitwise_mismatch > 0)))) {
+                first_grad_diff = record.name;
+            }
+            if (first_param_diff == "none"
+                && (record.param_metrics.max_abs > 0.0 || record.param_metrics.count_bitwise_mismatch > 0)) {
+                first_param_diff = record.name;
+            }
+        }
+        LOG(INFO) << "PARAM_STAGE_SUMMARY stage=" << stage
+                  << " first_gradient_diff_param=" << first_grad_diff
+                  << " first_parameter_diff_param=" << first_param_diff;
+
+        std::vector<const ParameterDiffRecord *> grad_sorted;
+        std::vector<const ParameterDiffRecord *> param_sorted;
+        grad_sorted.reserve(records.size());
+        param_sorted.reserve(records.size());
+        for (const auto &record : records) {
+            grad_sorted.push_back(&record);
+            param_sorted.push_back(&record);
+        }
+        std::sort(grad_sorted.begin(), grad_sorted.end(), [](const auto *lhs, const auto *rhs) {
+            const double lhs_value = lhs->grad_presence_mismatch
+                                         ? std::numeric_limits<double>::infinity()
+                                         : (lhs->has_grad_metrics ? lhs->grad_metrics.max_abs : 0.0);
+            const double rhs_value = rhs->grad_presence_mismatch
+                                         ? std::numeric_limits<double>::infinity()
+                                         : (rhs->has_grad_metrics ? rhs->grad_metrics.max_abs : 0.0);
+            if (lhs_value != rhs_value) {
+                return lhs_value > rhs_value;
+            }
+            return lhs->name < rhs->name;
+        });
+        std::sort(param_sorted.begin(), param_sorted.end(), [](const auto *lhs, const auto *rhs) {
+            if (lhs->param_metrics.max_abs != rhs->param_metrics.max_abs) {
+                return lhs->param_metrics.max_abs > rhs->param_metrics.max_abs;
+            }
+            return lhs->name < rhs->name;
+        });
+
+        const size_t limit = std::min<size_t>(10, records.size());
+        for (size_t rank = 0; rank < limit; ++rank) {
+            const auto *record = grad_sorted[rank];
+            LOG(INFO) << "PARAM_GRAD_TOP stage=" << stage
+                      << " rank=" << rank
+                      << " name=" << record->name
+                      << " grad_present_lhs=" << record->grad_present_lhs
+                      << " grad_present_rhs=" << record->grad_present_rhs
+                      << " grad_max_abs=" << (record->has_grad_metrics ? record->grad_metrics.max_abs : 0.0)
+                      << " grad_mean_abs=" << (record->has_grad_metrics ? record->grad_metrics.mean_abs : 0.0)
+                      << " grad_rmse=" << (record->has_grad_metrics ? record->grad_metrics.rmse : 0.0)
+                      << " grad_first_mismatch="
+                      << (record->has_grad_metrics
+                              ? OptionalIndexString(record->grad_metrics.has_bitwise_mismatch,
+                                                    record->grad_metrics.first_mismatch)
+                              : std::string("none"));
+        }
+        for (size_t rank = 0; rank < limit; ++rank) {
+            const auto *record = param_sorted[rank];
+            LOG(INFO) << "PARAM_VALUE_TOP stage=" << stage
+                      << " rank=" << rank
+                      << " name=" << record->name
+                      << " param_max_abs=" << record->param_metrics.max_abs
+                      << " param_mean_abs=" << record->param_metrics.mean_abs
+                      << " param_rmse=" << record->param_metrics.rmse
+                      << " param_first_mismatch="
+                      << OptionalIndexString(record->param_metrics.has_bitwise_mismatch,
+                                             record->param_metrics.first_mismatch);
+        }
+    }
+
+    std::vector<ParameterDiffRecord> CompareAndLogAllParameters(const std::string &stage, int update, int micro,
+                                                                GPT2 &lhs, GPT2 &rhs,
+                                                                FirstDivergenceTracker &tracker) {
+        const auto lhs_state = lhs.StateDict();
+        const auto rhs_state = rhs.StateDict();
+        const auto names = SortedParameterNames(lhs_state);
+        CHECK_EQ(lhs_state.size(), rhs_state.size());
+
+        std::vector<ParameterDiffRecord> records;
+        records.reserve(names.size());
+        for (const auto &name : names) {
+            const auto lhs_it = lhs_state.find(name);
+            const auto rhs_it = rhs_state.find(name);
+            CHECK(lhs_it != lhs_state.end());
+            CHECK(rhs_it != rhs_state.end()) << name;
+
+            ParameterDiffRecord record;
+            record.name = name;
+            record.dims = DimsToString(lhs_it->second->Dims());
+            record.param_metrics = CompareFloatTensors(*lhs_it->second, *rhs_it->second, kDiagnosticTolerance);
+            EXPECT_FALSE(TensorHasNonFiniteDiffInput(record.param_metrics)) << stage << " " << name;
+            tracker.ObserveTensor(update, micro, stage, name, record.param_metrics);
+
+            const auto lhs_grad = lhs_it->second->grad();
+            const auto rhs_grad = rhs_it->second->grad();
+            record.grad_present_lhs = lhs_grad != nullptr;
+            record.grad_present_rhs = rhs_grad != nullptr;
+            record.grad_presence_mismatch = record.grad_present_lhs != record.grad_present_rhs;
+            if (lhs_grad && rhs_grad) {
+                record.has_grad_metrics = true;
+                record.grad_metrics = CompareFloatTensors(*lhs_grad, *rhs_grad, kDiagnosticTolerance);
+                EXPECT_FALSE(TensorHasNonFiniteDiffInput(record.grad_metrics)) << stage << " " << name << ".grad";
+                tracker.ObserveTensor(update, micro, stage, name + ".grad", record.grad_metrics);
+            } else if (record.grad_presence_mismatch) {
+                tracker.ObserveScalar(update, micro, stage, name + ".grad_present", true, 0.0);
+            }
+
+            LOG(INFO) << "PARAM_COMPARE stage=" << stage
+                      << " update=" << update
+                      << " micro=" << micro
+                      << " name=" << name
+                      << " shape=" << record.dims
+                      << " grad_present_lhs=" << record.grad_present_lhs
+                      << " grad_present_rhs=" << record.grad_present_rhs
+                      << " grad_max_abs=" << (record.has_grad_metrics ? record.grad_metrics.max_abs : 0.0)
+                      << " grad_mean_abs=" << (record.has_grad_metrics ? record.grad_metrics.mean_abs : 0.0)
+                      << " grad_rmse=" << (record.has_grad_metrics ? record.grad_metrics.rmse : 0.0)
+                      << " grad_first_mismatch="
+                      << (record.has_grad_metrics
+                              ? OptionalIndexString(record.grad_metrics.has_bitwise_mismatch,
+                                                    record.grad_metrics.first_mismatch)
+                              : std::string("none"))
+                      << " grad_count_bitwise_mismatch="
+                      << (record.has_grad_metrics ? record.grad_metrics.count_bitwise_mismatch : 0)
+                      << " grad_count_gt_tolerance="
+                      << (record.has_grad_metrics ? record.grad_metrics.count_gt_tolerance : 0)
+                      << " param_max_abs=" << record.param_metrics.max_abs
+                      << " param_mean_abs=" << record.param_metrics.mean_abs
+                      << " param_rmse=" << record.param_metrics.rmse
+                      << " param_first_mismatch="
+                      << OptionalIndexString(record.param_metrics.has_bitwise_mismatch, record.param_metrics.first_mismatch)
+                      << " param_count_bitwise_mismatch=" << record.param_metrics.count_bitwise_mismatch
+                      << " param_count_gt_tolerance=" << record.param_metrics.count_gt_tolerance;
+            records.push_back(std::move(record));
+        }
+        LogParameterDiffSummary(stage, records);
+        return records;
+    }
+
+    void LogWorstLogitsRow(const std::string &stage, const TensorComparisonMetrics &metrics) {
+        if (metrics.row_metrics.empty()) {
+            return;
+        }
+        const auto max_row = BestRowByMaxAbs(metrics);
+        LOG(INFO) << "WORST_LOGITS_ROW stage=" << stage
+                  << " batch=" << max_row.batch
+                  << " sequence=" << max_row.sequence
+                  << " logits_max_abs=" << max_row.max_abs
+                  << " logits_mean_abs=" << max_row.mean_abs
+                  << " logits_rmse=" << max_row.rmse
+                  << " logits_count_gt_tolerance=" << max_row.count_gt_tolerance;
+    }
+
+
     void ConfigureGradAccumulation() {
         const auto tokens_per_fwdbwd = batch_size * sequence_length;
         grad_accum_steps = total_batch_size / tokens_per_fwdbwd;
@@ -1792,6 +2494,95 @@ TEST_F(GPT2TrainingTest, TrainingStageDiagnostics) {
     Initialize();
     auto second_run = RunTrainingDiagnosticsSequence(2, DiagnosticMode::kFull, num_iteration, false);
     CompareDiagnosticRuns(first_run, second_run);
+}
+
+
+TEST_F(GPT2TrainingTest, TiedTrainingFirstDivergenceDiagnostics) {
+    ConfigureGradAccumulation();
+    ASSERT_EQ(grad_accum_steps, 2);
+    LOG(INFO) << "PAIRED_DIAGNOSTIC_BEGIN batch_size=" << batch_size
+              << " sequence_length=" << sequence_length
+              << " grad_accum_steps=" << grad_accum_steps
+              << " learning_rate=" << learning_rate
+              << " step0_full_parameter_scan=true";
+
+    auto microbatches = LoadDiagnosticMicrobatches(grad_accum_steps);
+
+    model.reset();
+    optimizer.reset();
+    loss_fn.reset();
+    tokenizer.reset();
+
+    PairedTrainingRun lhs;
+    PairedTrainingRun rhs;
+    InitializePairedTrainingRun(lhs, 1);
+    InitializePairedTrainingRun(rhs, 2);
+
+    FirstDivergenceTracker first_divergence;
+    (void)CompareAndLogAllParameters("load", -1, -1, *lhs.model, *rhs.model, first_divergence);
+
+    auto initial_lhs = RunDiagnosticForward(lhs, microbatches[0]);
+    auto initial_rhs = RunDiagnosticForward(rhs, microbatches[0]);
+    LogLossComparison("initial_forward", -1, -1, initial_lhs.loss_value, initial_rhs.loss_value, first_divergence);
+    auto initial_forward = CompareForwardDiagnostics("initial_forward", -1, -1, lhs.diagnostics, rhs.diagnostics,
+                                                     first_divergence);
+    const bool initial_loss_equal = std::memcmp(&initial_lhs.loss_value, &initial_rhs.loss_value, sizeof(float)) == 0;
+    LOG(INFO) << "INITIAL_FORWARD_BITWISE_EQUAL value=" << (initial_loss_equal && initial_forward.BitwiseEqual())
+              << " loss_equal=" << initial_loss_equal
+              << " final_block_equal=" << (initial_forward.final_block_output.count_bitwise_mismatch == 0)
+              << " ln_f_equal=" << (initial_forward.ln_f_output.count_bitwise_mismatch == 0)
+              << " lm_head_input_equal=" << (initial_forward.lm_head_input.count_bitwise_mismatch == 0)
+              << " logits_equal=" << (initial_forward.logits.count_bitwise_mismatch == 0);
+    initial_lhs = DiagnosticForwardResult{};
+    initial_rhs = DiagnosticForwardResult{};
+    lhs.diagnostics.Clear();
+    rhs.diagnostics.Clear();
+
+    lhs.optimizer->ZeroGrad();
+    rhs.optimizer->ZeroGrad();
+    LOG(INFO) << "PAIRED_UPDATE_START update=0 microbatch_count=" << grad_accum_steps;
+
+    TensorComparisonMetrics worst_logits_metrics;
+    std::string worst_logits_stage = "none";
+    auto observe_worst_logits = [&](const std::string &stage, const TensorComparisonMetrics &metrics) {
+        if (worst_logits_stage == "none" || metrics.max_abs > worst_logits_metrics.max_abs) {
+            worst_logits_stage = stage;
+            worst_logits_metrics = metrics;
+        }
+    };
+    observe_worst_logits("initial_forward", initial_forward.logits);
+
+    for (int micro_step = 0; micro_step < grad_accum_steps; ++micro_step) {
+        const std::string forward_stage = "update0_micro" + std::to_string(micro_step) + "_forward";
+        auto forward_lhs = RunDiagnosticForward(lhs, microbatches[micro_step]);
+        auto forward_rhs = RunDiagnosticForward(rhs, microbatches[micro_step]);
+        LogLossComparison(forward_stage, 0, micro_step, forward_lhs.loss_value, forward_rhs.loss_value,
+                          first_divergence);
+        auto forward_metrics = CompareForwardDiagnostics(forward_stage, 0, micro_step, lhs.diagnostics, rhs.diagnostics,
+                                                         first_divergence);
+        observe_worst_logits(forward_stage, forward_metrics.logits);
+
+        forward_lhs.loss->Backward();
+        forward_rhs.loss->Backward();
+        const std::string backward_stage = "update0_micro" + std::to_string(micro_step) + "_backward";
+        (void)CompareAndLogAllParameters(backward_stage, 0, micro_step, *lhs.model, *rhs.model, first_divergence);
+    }
+
+    lhs.optimizer->Step();
+    rhs.optimizer->Step();
+    (void)CompareAndLogAllParameters("update0_optimizer_step", 0, -1, *lhs.model, *rhs.model, first_divergence);
+
+    lhs.optimizer->ZeroGrad();
+    rhs.optimizer->ZeroGrad();
+    auto next_lhs = RunDiagnosticForward(lhs, microbatches[0]);
+    auto next_rhs = RunDiagnosticForward(rhs, microbatches[0]);
+    LogLossComparison("update1_start_forward", 1, 0, next_lhs.loss_value, next_rhs.loss_value, first_divergence);
+    auto next_forward = CompareForwardDiagnostics("update1_start_forward", 1, 0, lhs.diagnostics, rhs.diagnostics,
+                                                  first_divergence);
+    observe_worst_logits("update1_start_forward", next_forward.logits);
+
+    LogWorstLogitsRow(worst_logits_stage, worst_logits_metrics);
+    first_divergence.Log();
 }
 
 

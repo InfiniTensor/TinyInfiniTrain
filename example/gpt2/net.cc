@@ -43,6 +43,27 @@ private:
 static std::mt19937 gen{kRandomSeed};
 } // namespace
 
+void GPT2ForwardDiagnostics::Clear() {
+    transformer_input.reset();
+    final_block_output.reset();
+    ln_f_output.reset();
+    lm_head_input.reset();
+    logits.reset();
+    block_outputs.clear();
+}
+
+void GPT2ForwardDiagnostics::RecordBlockOutput(int64_t block_index,
+                                               const std::shared_ptr<infini_train::Tensor> &output) {
+    if (!capture_block_outputs || block_index < 0) {
+        return;
+    }
+    const auto index = static_cast<size_t>(block_index);
+    if (block_outputs.size() <= index) {
+        block_outputs.resize(index + 1);
+    }
+    block_outputs[index] = output;
+}
+
 std::vector<std::shared_ptr<infini_train::Tensor>>
 NewGELU::Forward(const std::vector<std::shared_ptr<infini_train::Tensor>> &x) {
     auto &input = x[0];
@@ -135,7 +156,8 @@ MLP::Forward(const std::vector<std::shared_ptr<infini_train::Tensor>> &x) {
     return x3;
 }
 
-Block::Block(const GPT2Config &config) {
+Block::Block(const GPT2Config &config, int64_t diagnostic_index, GPT2ForwardDiagnostics **forward_diagnostics)
+    : diagnostic_index_(diagnostic_index), forward_diagnostics_(forward_diagnostics) {
     modules_[kLn1LayerName] = std::make_unique<nn::LayerNorm>(std::vector<int64_t>{config.n_embd});
     modules_[kAttnLayerName] = std::make_unique<CausalSelfAttention>(config);
     modules_[kLn2LayerName] = std::make_unique<nn::LayerNorm>(std::vector<int64_t>{config.n_embd});
@@ -151,6 +173,9 @@ Block::Forward(const std::vector<std::shared_ptr<infini_train::Tensor>> &x) {
     // -> Add -> (bs, seq_len, n_embd)
     auto x2 = x1 + modules_[kMlpLayerName]->Forward(modules_[kLn2LayerName]->Forward({x1}))[0];
     // (bs, seq_len, n_embd)
+    if (forward_diagnostics_ != nullptr && *forward_diagnostics_ != nullptr) {
+        (*forward_diagnostics_)->RecordBlockOutput(diagnostic_index_, x2);
+    }
     return {x2};
 }
 
@@ -161,7 +186,9 @@ GPT2::GPT2(const GPT2Config &config) : config_(config) {
         transformer[kWPELayerName] = std::make_unique<nn::Embedding>(config.block_size, config.n_embd);
         {
             std::vector<std::unique_ptr<nn::Module>> h;
-            for (int64_t i = 0; i < config.n_layer; i++) { h.push_back(std::make_unique<Block>(config)); }
+            for (int64_t i = 0; i < config.n_layer; i++) {
+                h.push_back(std::make_unique<Block>(config, i, &forward_diagnostics_));
+            }
             transformer[kHLayerName] = std::make_unique<nn::Sequential>(std::move(h));
         }
         transformer[kLnFLayerName] = std::make_unique<nn::LayerNorm>(std::vector<int64_t>{config.n_embd});
@@ -192,8 +219,16 @@ GPT2::GPT2(const GPT2Config &config) : config_(config) {
     });
 }
 
+void GPT2::SetForwardDiagnostics(GPT2ForwardDiagnostics *forward_diagnostics) {
+    forward_diagnostics_ = forward_diagnostics;
+}
+
 std::vector<std::shared_ptr<infini_train::Tensor>>
 GPT2::Forward(const std::vector<std::shared_ptr<infini_train::Tensor>> &x) {
+    if (forward_diagnostics_ != nullptr) {
+        forward_diagnostics_->Clear();
+    }
+
     // (bs, seq_len)
     auto &idx = x[0];
     const auto device = idx->GetDevice();
@@ -211,14 +246,27 @@ GPT2::Forward(const std::vector<std::shared_ptr<infini_train::Tensor>> &x) {
     auto pos_emb = transformer->mutable_module(kWPELayerName)->Forward({pos})[0];
     // (bs, seq_len, n_embd)
     auto x1 = tok_emb + pos_emb;
+    if (forward_diagnostics_ != nullptr) {
+        forward_diagnostics_->transformer_input = x1;
+    }
 
     // (bs, seq_len, n_embd) -> transformer -> (bs, seq_len, n_embd)
     auto x2 = transformer->mutable_module(kHLayerName)->Forward({x1});
+    if (forward_diagnostics_ != nullptr) {
+        forward_diagnostics_->final_block_output = x2[0];
+    }
     // (bs, seq_len, n_embd) -> Layernorm -> (bs, seq_len, n_embd)
     auto x3 = transformer->mutable_module(kLnFLayerName)->Forward(x2);
+    if (forward_diagnostics_ != nullptr) {
+        forward_diagnostics_->ln_f_output = x3[0];
+        forward_diagnostics_->lm_head_input = x3[0];
+    }
 
     // (bs, seq_len, n_embd) -> Linear(n_embd, vocab_size) -> (bs, seq_len, vocab_size)
     auto logits = modules_[kLMHeadLayerName]->Forward(x3);
+    if (forward_diagnostics_ != nullptr) {
+        forward_diagnostics_->logits = logits[0];
+    }
 
     // (bs, seq_len, vocab_size)
     return logits;
