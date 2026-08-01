@@ -1,4 +1,18 @@
 build/
 .cache/
 .vscode/
-Data/
+Data/*
+!Data/gpt2_logits_reference.bin
+!Data/gpt2_logits_reference_tied_10_updates.bin
+
+# GPT-2 reference generation candidates and scratch outputs.
+Data/*.generated
+Data/*.generated.tmp
+Data/*_run*.bin.generated
+Data/*_run*.meta.txt.generated
+Data/*reference*candidate*.log
+Data/*_run*.log
+gpt2_tied_ref_run*.bin.generated
+gpt2_tied_ref_run*.meta.txt.generated
+gpt2_tied_ref_run*.log
+gpt2_reference_candidate*.log

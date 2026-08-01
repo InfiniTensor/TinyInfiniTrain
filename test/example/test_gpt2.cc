@@ -1,17 +1,29 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cctype>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <ctime>
 #include <cmath>
 #include <cstdlib>
+#include <filesystem>
 #include <format>
 #include <memory>
 #include <limits>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <fstream>
+#include <iomanip>
+#include <iterator>
+#include <sstream>
+#include <stdexcept>
+#include <system_error>
 #include <vector>
 #include <gtest/gtest.h>
 
@@ -23,6 +35,11 @@
 #include "example/common/tiny_shakespeare_dataset.h"
 #include "example/common/tokenizer.h"
 #include "example/gpt2/net.h"
+
+#ifdef USE_CUDA
+#include <cublas_v2.h>
+#include <cuda_runtime_api.h>
+#endif
 
 namespace infini_train {
 
@@ -292,6 +309,856 @@ void LogOptimizerAliases(const char *stage, const std::vector<std::shared_ptr<Te
     }
 }
 
+
+struct LogitsBinary {
+    std::vector<int64_t> dims;
+    std::vector<float> data;
+};
+
+struct RowDiffMetrics {
+    size_t row_index = 0;
+    size_t batch = 0;
+    size_t sequence = 0;
+    double max_abs = 0.0;
+    double mean_abs = 0.0;
+    double rmse = 0.0;
+    size_t count_gt_tolerance = 0;
+};
+
+struct LogitsComparisonMetrics {
+    size_t elements = 0;
+    bool has_mismatch = false;
+    size_t first_mismatch = 0;
+    size_t first_mismatch_batch = 0;
+    size_t first_mismatch_sequence = 0;
+    size_t first_mismatch_vocab = 0;
+    double max_abs = 0.0;
+    double mean_abs = 0.0;
+    double rmse = 0.0;
+    size_t count_gt_tolerance = 0;
+    size_t rows_with_gt_tolerance = 0;
+    size_t rows_with_full_vocab_gt_tolerance = 0;
+    size_t reference_nan_count = 0;
+    size_t candidate_nan_count = 0;
+    size_t reference_inf_count = 0;
+    size_t candidate_inf_count = 0;
+    double cosine = 0.0;
+    bool cosine_defined = false;
+    float reference0 = 0.0f;
+    float candidate0 = 0.0f;
+    float reference_probe = 0.0f;
+    float candidate_probe = 0.0f;
+    std::vector<RowDiffMetrics> row_metrics;
+};
+
+struct GitMetadata {
+    std::string branch = "unknown";
+    std::string commit = "unknown";
+    bool working_tree_dirty = true;
+    std::string unstaged_diff_sha256 = "unknown";
+    std::string staged_diff_sha256 = "unknown";
+    std::string status_porcelain_sha256 = "unknown";
+};
+
+struct ReferenceTraceMetadata {
+    GitMetadata git;
+    std::string model_checkpoint_path;
+    std::string model_checkpoint_sha256;
+    std::string training_dataset_path;
+    std::string training_dataset_sha256;
+    std::string tokenizer_path;
+    std::string tokenizer_sha256;
+    std::string training_microbatches_sha256;
+    int training_microbatch_count = 0;
+    int training_microbatches_repeated_use_count = 0;
+    std::string final_forward_input_sha256;
+    std::string final_forward_target_sha256;
+};
+
+struct ReferenceHeader {
+    uint32_t magic = 0;
+    uint32_t version = 0;
+    uint32_t dtype = 0;
+    uint32_t ndim = 0;
+    uint64_t num_elements = 0;
+};
+
+struct ReferenceWriteResult {
+    std::string path;
+    std::string sha256;
+};
+
+static_assert(sizeof(ReferenceHeader) == 24);
+
+constexpr uint32_t kReferenceMagic = 0x46523247u; // "G2RF" in little-endian byte order.
+constexpr uint32_t kReferenceVersion = 1;
+constexpr uint32_t kReferenceDtypeFloat32 = 1;
+
+[[noreturn]] void ThrowRuntimeError(const std::string &message) {
+    throw std::runtime_error(message);
+}
+
+void RequireOrThrow(bool condition, const std::string &message) {
+    if (!condition) {
+        ThrowRuntimeError(message);
+    }
+}
+
+bool EndsWith(std::string_view value, std::string_view suffix) {
+    return value.size() >= suffix.size() && value.substr(value.size() - suffix.size()) == suffix;
+}
+
+std::string TrimWhitespace(std::string value) {
+    while (!value.empty() && std::isspace(static_cast<unsigned char>(value.back()))) {
+        value.pop_back();
+    }
+    size_t first = 0;
+    while (first < value.size() && std::isspace(static_cast<unsigned char>(value[first]))) {
+        ++first;
+    }
+    return value.substr(first);
+}
+
+std::string ReadTextFileFirstLine(const std::filesystem::path &path) {
+    std::ifstream input(path);
+    std::string line;
+    std::getline(input, line);
+    return line;
+}
+
+std::filesystem::path FindRepoRoot() {
+    auto path = std::filesystem::current_path();
+    while (!path.empty()) {
+        if (std::filesystem::exists(path / ".git")) {
+            return path;
+        }
+        path = path.parent_path();
+    }
+    return std::filesystem::current_path();
+}
+
+std::filesystem::path ResolveGitDir(const std::filesystem::path &repo_root) {
+    const auto git_path = repo_root / ".git";
+    if (std::filesystem::is_directory(git_path)) {
+        return git_path;
+    }
+    if (!std::filesystem::is_regular_file(git_path)) {
+        return {};
+    }
+
+    const auto line = ReadTextFileFirstLine(git_path);
+    constexpr std::string_view prefix = "gitdir: ";
+    if (line.rfind(prefix, 0) != 0) {
+        return {};
+    }
+    std::filesystem::path git_dir(line.substr(prefix.size()));
+    if (git_dir.is_relative()) {
+        git_dir = repo_root / git_dir;
+    }
+    return git_dir.lexically_normal();
+}
+
+std::string ShellQuote(const std::string &value) {
+    std::string quoted = "'";
+    for (const char c : value) {
+        if (c == '\'') {
+            quoted += "'\\''";
+        } else {
+            quoted += c;
+        }
+    }
+    quoted += "'";
+    return quoted;
+}
+
+std::string RunCommandCapture(const std::string &command) {
+    FILE *pipe = popen(command.c_str(), "r");
+    RequireOrThrow(pipe != nullptr, "Failed to run command: " + command);
+    std::array<char, 4096> buffer{};
+    std::string output;
+    while (fgets(buffer.data(), static_cast<int>(buffer.size()), pipe) != nullptr) {
+        output += buffer.data();
+    }
+    const int status = pclose(pipe);
+    RequireOrThrow(status == 0, "Command failed with status " + std::to_string(status) + ": " + command);
+    return output;
+}
+
+std::string RunGitCommand(const std::filesystem::path &repo_root, const std::string &args) {
+    return RunCommandCapture("git -C " + ShellQuote(repo_root.string()) + " " + args);
+}
+
+void AppendBytes(std::vector<uint8_t> &bytes, const void *data, size_t size) {
+    if (size == 0) {
+        return;
+    }
+    const auto *begin = static_cast<const uint8_t *>(data);
+    bytes.insert(bytes.end(), begin, begin + size);
+}
+
+template <typename T> void AppendPod(std::vector<uint8_t> &bytes, const T &value) {
+    AppendBytes(bytes, &value, sizeof(T));
+}
+
+void AppendStringRecord(std::vector<uint8_t> &bytes, std::string_view value) {
+    const uint64_t size = static_cast<uint64_t>(value.size());
+    AppendPod(bytes, size);
+    AppendBytes(bytes, value.data(), value.size());
+}
+
+uint32_t Sha256RotateRight(uint32_t value, uint32_t bits) {
+    return (value >> bits) | (value << (32 - bits));
+}
+
+std::string Sha256Hex(const uint8_t *data, size_t size) {
+    static constexpr std::array<uint32_t, 64> kRoundConstants = {
+        0x428a2f98u, 0x71374491u, 0xb5c0fbcfu, 0xe9b5dba5u, 0x3956c25bu, 0x59f111f1u, 0x923f82a4u,
+        0xab1c5ed5u, 0xd807aa98u, 0x12835b01u, 0x243185beu, 0x550c7dc3u, 0x72be5d74u, 0x80deb1feu,
+        0x9bdc06a7u, 0xc19bf174u, 0xe49b69c1u, 0xefbe4786u, 0x0fc19dc6u, 0x240ca1ccu, 0x2de92c6fu,
+        0x4a7484aau, 0x5cb0a9dcu, 0x76f988dau, 0x983e5152u, 0xa831c66du, 0xb00327c8u, 0xbf597fc7u,
+        0xc6e00bf3u, 0xd5a79147u, 0x06ca6351u, 0x14292967u, 0x27b70a85u, 0x2e1b2138u, 0x4d2c6dfcu,
+        0x53380d13u, 0x650a7354u, 0x766a0abbu, 0x81c2c92eu, 0x92722c85u, 0xa2bfe8a1u, 0xa81a664bu,
+        0xc24b8b70u, 0xc76c51a3u, 0xd192e819u, 0xd6990624u, 0xf40e3585u, 0x106aa070u, 0x19a4c116u,
+        0x1e376c08u, 0x2748774cu, 0x34b0bcb5u, 0x391c0cb3u, 0x4ed8aa4au, 0x5b9cca4fu, 0x682e6ff3u,
+        0x748f82eeu, 0x78a5636fu, 0x84c87814u, 0x8cc70208u, 0x90befffau, 0xa4506cebu, 0xbef9a3f7u,
+        0xc67178f2u,
+    };
+
+    std::array<uint32_t, 8> hash = {
+        0x6a09e667u, 0xbb67ae85u, 0x3c6ef372u, 0xa54ff53au,
+        0x510e527fu, 0x9b05688cu, 0x1f83d9abu, 0x5be0cd19u,
+    };
+
+    std::vector<uint8_t> message;
+    if (size > 0) {
+        message.assign(data, data + size);
+    }
+    const uint64_t bit_size = static_cast<uint64_t>(size) * 8u;
+    message.push_back(0x80u);
+    while ((message.size() % 64) != 56) {
+        message.push_back(0u);
+    }
+    for (int shift = 56; shift >= 0; shift -= 8) {
+        message.push_back(static_cast<uint8_t>((bit_size >> shift) & 0xffu));
+    }
+
+    for (size_t offset = 0; offset < message.size(); offset += 64) {
+        std::array<uint32_t, 64> words{};
+        for (size_t i = 0; i < 16; ++i) {
+            const size_t j = offset + i * 4;
+            words[i] = (static_cast<uint32_t>(message[j]) << 24) | (static_cast<uint32_t>(message[j + 1]) << 16)
+                       | (static_cast<uint32_t>(message[j + 2]) << 8) | static_cast<uint32_t>(message[j + 3]);
+        }
+        for (size_t i = 16; i < 64; ++i) {
+            const uint32_t s0 = Sha256RotateRight(words[i - 15], 7) ^ Sha256RotateRight(words[i - 15], 18)
+                                ^ (words[i - 15] >> 3);
+            const uint32_t s1 = Sha256RotateRight(words[i - 2], 17) ^ Sha256RotateRight(words[i - 2], 19)
+                                ^ (words[i - 2] >> 10);
+            words[i] = words[i - 16] + s0 + words[i - 7] + s1;
+        }
+
+        uint32_t a = hash[0];
+        uint32_t b = hash[1];
+        uint32_t c = hash[2];
+        uint32_t d = hash[3];
+        uint32_t e = hash[4];
+        uint32_t f = hash[5];
+        uint32_t g = hash[6];
+        uint32_t h = hash[7];
+
+        for (size_t i = 0; i < 64; ++i) {
+            const uint32_t s1 = Sha256RotateRight(e, 6) ^ Sha256RotateRight(e, 11) ^ Sha256RotateRight(e, 25);
+            const uint32_t ch = (e & f) ^ ((~e) & g);
+            const uint32_t temp1 = h + s1 + ch + kRoundConstants[i] + words[i];
+            const uint32_t s0 = Sha256RotateRight(a, 2) ^ Sha256RotateRight(a, 13) ^ Sha256RotateRight(a, 22);
+            const uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
+            const uint32_t temp2 = s0 + maj;
+            h = g;
+            g = f;
+            f = e;
+            e = d + temp1;
+            d = c;
+            c = b;
+            b = a;
+            a = temp1 + temp2;
+        }
+
+        hash[0] += a;
+        hash[1] += b;
+        hash[2] += c;
+        hash[3] += d;
+        hash[4] += e;
+        hash[5] += f;
+        hash[6] += g;
+        hash[7] += h;
+    }
+
+    std::ostringstream oss;
+    for (const auto value : hash) {
+        oss << std::hex << std::setfill('0') << std::setw(8) << value;
+    }
+    return oss.str();
+}
+
+std::string Sha256Bytes(const std::vector<uint8_t> &bytes) {
+    return Sha256Hex(bytes.empty() ? nullptr : bytes.data(), bytes.size());
+}
+
+std::string Sha256TextOrNone(const std::string &text) {
+    if (text.empty()) {
+        return "none";
+    }
+    return Sha256Hex(reinterpret_cast<const uint8_t *>(text.data()), text.size());
+}
+
+std::vector<uint8_t> ReadFileBytesOrThrow(const std::string &filename) {
+    std::ifstream input(filename, std::ios::binary);
+    RequireOrThrow(input.is_open(), "Failed to open file for sha256: " + filename);
+    std::vector<char> raw((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    RequireOrThrow(!input.bad(), "Failed to read file for sha256: " + filename);
+    return std::vector<uint8_t>(raw.begin(), raw.end());
+}
+
+std::string Sha256File(const std::string &filename) {
+    return Sha256Bytes(ReadFileBytesOrThrow(filename));
+}
+
+GitMetadata ReadGitMetadata() {
+    GitMetadata metadata;
+    const auto repo_root = FindRepoRoot();
+    const auto git_dir = ResolveGitDir(repo_root);
+    if (git_dir.empty()) {
+        return metadata;
+    }
+
+    const auto head = ReadTextFileFirstLine(git_dir / "HEAD");
+    constexpr std::string_view ref_prefix = "ref: ";
+    if (head.rfind(ref_prefix, 0) == 0) {
+        const std::string ref = head.substr(ref_prefix.size());
+        constexpr std::string_view heads_prefix = "refs/heads/";
+        metadata.branch = ref.rfind(heads_prefix, 0) == 0 ? ref.substr(heads_prefix.size()) : ref;
+        const auto ref_path = git_dir / ref;
+        if (std::filesystem::exists(ref_path)) {
+            metadata.commit = ReadTextFileFirstLine(ref_path);
+        }
+    } else if (!head.empty()) {
+        metadata.branch = "detached";
+        metadata.commit = head;
+    }
+
+    const auto status = RunGitCommand(repo_root, "status --porcelain --untracked-files=all");
+    const auto unstaged_diff = RunGitCommand(repo_root, "diff --binary");
+    const auto staged_diff = RunGitCommand(repo_root, "diff --cached --binary");
+    metadata.working_tree_dirty = !TrimWhitespace(status).empty();
+    metadata.status_porcelain_sha256 = Sha256TextOrNone(status);
+    metadata.unstaged_diff_sha256 = Sha256TextOrNone(unstaged_diff);
+    metadata.staged_diff_sha256 = Sha256TextOrNone(staged_diff);
+    return metadata;
+}
+
+std::string CurrentDateTimeString() {
+    const auto now = std::time(nullptr);
+    std::tm tm{};
+    localtime_r(&now, &tm);
+    std::ostringstream oss;
+    oss << std::put_time(&tm, "%Y-%m-%d %H:%M:%S %z");
+    return oss.str();
+}
+
+bool EnvFlagEnabled(const char *name) {
+    const char *value = std::getenv(name);
+    return value != nullptr && std::string(value) == "1";
+}
+
+std::string EnvOrDefault(const char *name, const std::string &default_value) {
+    const char *value = std::getenv(name);
+    return value != nullptr && value[0] != '\0' ? std::string(value) : default_value;
+}
+
+uint64_t FileSizeOrThrow(const std::string &filename) {
+    std::error_code ec;
+    const auto size = std::filesystem::file_size(filename, ec);
+    RequireOrThrow(!ec, "Failed to stat file: " + filename + ": " + ec.message());
+    return static_cast<uint64_t>(size);
+}
+
+void ReadExact(std::ifstream &input, void *data, uint64_t size, const std::string &context) {
+    RequireOrThrow(size <= static_cast<uint64_t>(std::numeric_limits<std::streamsize>::max()),
+                   "Read too large for streamsize: " + context);
+    if (size == 0) {
+        return;
+    }
+    input.read(static_cast<char *>(data), static_cast<std::streamsize>(size));
+    RequireOrThrow(static_cast<uint64_t>(input.gcount()) == size, "Short read while reading " + context);
+}
+
+void WriteExact(std::ofstream &output, const void *data, uint64_t size, const std::string &context) {
+    RequireOrThrow(size <= static_cast<uint64_t>(std::numeric_limits<std::streamsize>::max()),
+                   "Write too large for streamsize: " + context);
+    if (size == 0) {
+        return;
+    }
+    output.write(static_cast<const char *>(data), static_cast<std::streamsize>(size));
+    RequireOrThrow(output.good(), "Failed to write " + context);
+}
+
+template <typename T> T ReadPod(std::ifstream &input, const std::string &context) {
+    T value{};
+    ReadExact(input, &value, sizeof(T), context);
+    return value;
+}
+
+uint64_t CheckedElementCount(const std::vector<int64_t> &dims) {
+    RequireOrThrow(!dims.empty(), "Reference logits dims must not be empty");
+    uint64_t count = 1;
+    for (const auto dim : dims) {
+        RequireOrThrow(dim > 0, "Reference logits dim must be positive: " + std::to_string(dim));
+        const auto udim = static_cast<uint64_t>(dim);
+        RequireOrThrow(count <= std::numeric_limits<uint64_t>::max() / udim,
+                       "Reference logits element count overflows uint64_t");
+        count *= udim;
+    }
+    RequireOrThrow(count <= static_cast<uint64_t>(std::numeric_limits<size_t>::max()),
+                   "Reference logits element count overflows size_t");
+    return count;
+}
+
+void ValidateFinitePayloadOrThrow(const LogitsBinary &logits, const std::string &context) {
+    size_t nan_count = 0;
+    size_t inf_count = 0;
+    for (const auto value : logits.data) {
+        nan_count += std::isnan(value) ? 1 : 0;
+        inf_count += std::isinf(value) ? 1 : 0;
+    }
+    RequireOrThrow(nan_count == 0 && inf_count == 0,
+                   context + " contains non-finite logits: nan=" + std::to_string(nan_count)
+                       + " inf=" + std::to_string(inf_count));
+}
+
+LogitsBinary ReadNewLogitsBinaryFile(const std::string &filename) {
+    const auto file_size = FileSizeOrThrow(filename);
+    std::ifstream infile(filename, std::ios::binary);
+    RequireOrThrow(infile.is_open(), "Failed to open logits file: " + filename);
+
+    const auto header = ReadPod<ReferenceHeader>(infile, filename + " header");
+    RequireOrThrow(header.magic == kReferenceMagic,
+                   "Invalid reference magic in " + filename + ": " + std::to_string(header.magic));
+    RequireOrThrow(header.version == kReferenceVersion,
+                   "Unsupported reference version in " + filename + ": " + std::to_string(header.version));
+    RequireOrThrow(header.dtype == kReferenceDtypeFloat32,
+                   "Unsupported reference dtype in " + filename + ": " + std::to_string(header.dtype));
+    RequireOrThrow(header.ndim > 0, "Reference ndim must be positive: " + filename);
+    RequireOrThrow(header.ndim <= 8, "Reference ndim is unexpectedly large: " + filename);
+
+    std::vector<int64_t> dims(header.ndim);
+    ReadExact(infile, dims.data(), static_cast<uint64_t>(dims.size() * sizeof(int64_t)), filename + " dims");
+    const auto num_elements = CheckedElementCount(dims);
+    RequireOrThrow(num_elements == header.num_elements,
+                   "Header num_elements does not match dims product in " + filename);
+    const uint64_t expected_size = sizeof(ReferenceHeader) + static_cast<uint64_t>(dims.size() * sizeof(int64_t))
+                                   + num_elements * sizeof(float);
+    RequireOrThrow(file_size == expected_size,
+                   "Reference file size mismatch for " + filename + ": expected " + std::to_string(expected_size)
+                       + " actual " + std::to_string(file_size));
+
+    std::vector<float> data(static_cast<size_t>(num_elements));
+    ReadExact(infile, data.data(), num_elements * sizeof(float), filename + " payload");
+    RequireOrThrow(infile.peek() == std::char_traits<char>::eof(), "Reference file has trailing bytes: " + filename);
+    LogitsBinary logits{.dims = std::move(dims), .data = std::move(data)};
+    ValidateFinitePayloadOrThrow(logits, filename);
+    return logits;
+}
+
+LogitsBinary ReadLegacyLogitsBinaryFile(const std::string &filename) {
+    const auto file_size = FileSizeOrThrow(filename);
+    std::ifstream infile(filename, std::ios::binary);
+    RequireOrThrow(infile.is_open(), "Failed to open legacy logits file: " + filename);
+
+    const auto num_dims = ReadPod<size_t>(infile, filename + " legacy num_dims");
+    RequireOrThrow(num_dims > 0 && num_dims <= 8, "Invalid legacy logits ndim in " + filename);
+    std::vector<int64_t> dims(num_dims);
+    ReadExact(infile, dims.data(), static_cast<uint64_t>(dims.size() * sizeof(int64_t)), filename + " legacy dims");
+    const auto num_elements = CheckedElementCount(dims);
+    const uint64_t expected_size = sizeof(size_t) + static_cast<uint64_t>(dims.size() * sizeof(int64_t))
+                                   + num_elements * sizeof(float);
+    RequireOrThrow(file_size == expected_size,
+                   "Legacy logits file size mismatch for " + filename + ": expected " + std::to_string(expected_size)
+                       + " actual " + std::to_string(file_size));
+
+    std::vector<float> data(static_cast<size_t>(num_elements));
+    ReadExact(infile, data.data(), num_elements * sizeof(float), filename + " legacy payload");
+    RequireOrThrow(infile.peek() == std::char_traits<char>::eof(), "Legacy logits file has trailing bytes: " + filename);
+    LogitsBinary logits{.dims = std::move(dims), .data = std::move(data)};
+    ValidateFinitePayloadOrThrow(logits, filename);
+    return logits;
+}
+
+LogitsBinary ReadLogitsBinaryFile(const std::string &filename) {
+    return ReadNewLogitsBinaryFile(filename);
+}
+
+LogitsBinary ReadLogitsBinaryFileAuto(const std::string &filename) {
+    std::ifstream infile(filename, std::ios::binary);
+    RequireOrThrow(infile.is_open(), "Failed to open logits file: " + filename);
+    const auto maybe_magic = ReadPod<uint32_t>(infile, filename + " format probe");
+    infile.close();
+    if (maybe_magic == kReferenceMagic) {
+        return ReadNewLogitsBinaryFile(filename);
+    }
+    return ReadLegacyLogitsBinaryFile(filename);
+}
+
+LogitsBinary CopyTensorToLogitsBinary(Tensor &tensor) {
+    CHECK_EQ(static_cast<int>(tensor.Dtype()), static_cast<int>(DataType::kFLOAT32));
+    auto cpu_tensor = tensor.To(Device(DeviceType::kCPU, 0));
+    const auto *data = static_cast<const float *>(cpu_tensor.DataPtr());
+    std::vector<float> copied(data, data + cpu_tensor.NumElements());
+    return {.dims = cpu_tensor.Dims(), .data = std::move(copied)};
+}
+
+void WriteLogitsBinaryFileRaw(const std::string &filename, const LogitsBinary &logits) {
+    ValidateFinitePayloadOrThrow(logits, filename);
+    const auto num_elements = CheckedElementCount(logits.dims);
+    RequireOrThrow(num_elements == logits.data.size(), "Logits data size does not match dims for " + filename);
+
+    std::ofstream outfile(filename, std::ios::binary | std::ios::trunc);
+    RequireOrThrow(outfile.is_open(), "Failed to open logits output file: " + filename);
+    const ReferenceHeader header{.magic = kReferenceMagic,
+                                 .version = kReferenceVersion,
+                                 .dtype = kReferenceDtypeFloat32,
+                                 .ndim = static_cast<uint32_t>(logits.dims.size()),
+                                 .num_elements = num_elements};
+    WriteExact(outfile, &header, sizeof(header), filename + " header");
+    WriteExact(outfile, logits.dims.data(), static_cast<uint64_t>(logits.dims.size() * sizeof(int64_t)),
+               filename + " dims");
+    WriteExact(outfile, logits.data.data(), num_elements * sizeof(float), filename + " payload");
+    outfile.flush();
+    RequireOrThrow(outfile.good(), "Failed to flush logits output file: " + filename);
+    outfile.close();
+    RequireOrThrow(outfile.good(), "Failed to close logits output file: " + filename);
+}
+
+ReferenceWriteResult WriteLogitsBinaryFileAtomic(const std::string &filename, const LogitsBinary &logits,
+                                                 bool overwrite) {
+    const std::string tmp_filename = filename + ".tmp";
+    bool created_tmp = false;
+    try {
+        RequireOrThrow(overwrite || !std::filesystem::exists(filename),
+                       "Refusing to overwrite existing generated logits file: " + filename);
+        RequireOrThrow(!std::filesystem::exists(tmp_filename), "Temporary logits file already exists: " + tmp_filename);
+        created_tmp = true;
+        WriteLogitsBinaryFileRaw(tmp_filename, logits);
+        const auto verified = ReadNewLogitsBinaryFile(tmp_filename);
+        RequireOrThrow(verified.dims == logits.dims, "Verified logits dims mismatch for " + tmp_filename);
+        RequireOrThrow(verified.data == logits.data, "Verified logits payload mismatch for " + tmp_filename);
+        const auto sha256 = Sha256File(tmp_filename);
+        std::filesystem::rename(tmp_filename, filename);
+        created_tmp = false;
+        return {.path = filename, .sha256 = sha256};
+    } catch (...) {
+        if (created_tmp) {
+            std::error_code ec;
+            std::filesystem::remove(tmp_filename, ec);
+        }
+        throw;
+    }
+}
+
+void WriteTextFileAtomic(const std::string &filename, const std::string &contents, bool overwrite) {
+    const std::string tmp_filename = filename + ".tmp";
+    bool created_tmp = false;
+    try {
+        RequireOrThrow(overwrite || !std::filesystem::exists(filename),
+                       "Refusing to overwrite existing generated metadata file: " + filename);
+        RequireOrThrow(!std::filesystem::exists(tmp_filename), "Temporary metadata file already exists: " + tmp_filename);
+        created_tmp = true;
+        std::ofstream output(tmp_filename, std::ios::binary | std::ios::trunc);
+        RequireOrThrow(output.is_open(), "Failed to open metadata output file: " + tmp_filename);
+        WriteExact(output, contents.data(), contents.size(), tmp_filename + " contents");
+        output.flush();
+        RequireOrThrow(output.good(), "Failed to flush metadata output file: " + tmp_filename);
+        output.close();
+        RequireOrThrow(output.good(), "Failed to close metadata output file: " + tmp_filename);
+        created_tmp = true;
+        const auto written = ReadFileBytesOrThrow(tmp_filename);
+        const std::string roundtrip(reinterpret_cast<const char *>(written.data()), written.size());
+        RequireOrThrow(roundtrip == contents, "Verified metadata contents mismatch for " + tmp_filename);
+        std::filesystem::rename(tmp_filename, filename);
+        created_tmp = false;
+    } catch (...) {
+        if (created_tmp) {
+            std::error_code ec;
+            std::filesystem::remove(tmp_filename, ec);
+        }
+        throw;
+    }
+}
+
+void AppendTensorRecord(std::vector<uint8_t> &bytes, std::string_view label, Tensor &tensor) {
+    auto cpu_tensor = tensor.To(Device(DeviceType::kCPU, 0));
+    AppendStringRecord(bytes, label);
+    const int32_t dtype = static_cast<int32_t>(cpu_tensor.Dtype());
+    const uint64_t ndim = static_cast<uint64_t>(cpu_tensor.Dims().size());
+    const uint64_t num_elements = static_cast<uint64_t>(cpu_tensor.NumElements());
+    const uint64_t size_in_bytes = static_cast<uint64_t>(cpu_tensor.SizeInBytes());
+    AppendPod(bytes, dtype);
+    AppendPod(bytes, ndim);
+    for (const auto dim : cpu_tensor.Dims()) {
+        AppendPod(bytes, dim);
+    }
+    AppendPod(bytes, num_elements);
+    AppendPod(bytes, size_in_bytes);
+    AppendBytes(bytes, cpu_tensor.DataPtr(), static_cast<size_t>(size_in_bytes));
+}
+
+std::string HashTensorRecord(std::string_view label, Tensor &tensor) {
+    std::vector<uint8_t> bytes;
+    AppendTensorRecord(bytes, label, tensor);
+    return Sha256Bytes(bytes);
+}
+
+LogitsComparisonMetrics CompareLogitsFull(const LogitsBinary &reference, const LogitsBinary &candidate,
+                                          float tolerance) {
+    RequireOrThrow(reference.dims == candidate.dims,
+                   "reference dims=" + DimsToString(reference.dims) + " candidate dims=" + DimsToString(candidate.dims));
+    RequireOrThrow(reference.data.size() == candidate.data.size(), "Logits element count mismatch");
+    RequireOrThrow(!reference.data.empty(), "Logits comparison input is empty");
+
+    const bool has_rows = reference.dims.size() == 3;
+    const size_t batch_size = has_rows ? static_cast<size_t>(reference.dims[0]) : 0;
+    const size_t sequence_length = has_rows ? static_cast<size_t>(reference.dims[1]) : 0;
+    const size_t vocab_size = has_rows ? static_cast<size_t>(reference.dims[2]) : 0;
+    const size_t row_count = has_rows ? batch_size * sequence_length : 0;
+    std::vector<double> row_sum_abs(row_count, 0.0);
+    std::vector<double> row_sum_sq(row_count, 0.0);
+
+    LogitsComparisonMetrics metrics;
+    metrics.elements = reference.data.size();
+    double sum_abs = 0.0;
+    double sum_sq = 0.0;
+    double dot = 0.0;
+    double ref_sq = 0.0;
+    double cand_sq = 0.0;
+    for (size_t i = 0; i < reference.data.size(); ++i) {
+        const double ref = reference.data[i];
+        const double cand = candidate.data[i];
+        metrics.reference_nan_count += std::isnan(ref) ? 1 : 0;
+        metrics.candidate_nan_count += std::isnan(cand) ? 1 : 0;
+        metrics.reference_inf_count += std::isinf(ref) ? 1 : 0;
+        metrics.candidate_inf_count += std::isinf(cand) ? 1 : 0;
+        const bool nonfinite = !std::isfinite(ref) || !std::isfinite(cand);
+        const double diff = nonfinite ? std::numeric_limits<double>::infinity() : std::abs(ref - cand);
+        const bool mismatch = nonfinite || diff > tolerance;
+        if (!metrics.has_mismatch && mismatch) {
+            metrics.has_mismatch = true;
+            metrics.first_mismatch = i;
+            if (has_rows) {
+                metrics.first_mismatch_batch = i / (sequence_length * vocab_size);
+                const size_t remainder = i % (sequence_length * vocab_size);
+                metrics.first_mismatch_sequence = remainder / vocab_size;
+                metrics.first_mismatch_vocab = remainder % vocab_size;
+            }
+        }
+        metrics.max_abs = std::max(metrics.max_abs, diff);
+        sum_abs += diff;
+        sum_sq += diff * diff;
+        if (!nonfinite) {
+            dot += ref * cand;
+            ref_sq += ref * ref;
+            cand_sq += cand * cand;
+        }
+        if (mismatch) {
+            ++metrics.count_gt_tolerance;
+        }
+        if (has_rows) {
+            const size_t row_index = i / vocab_size;
+            row_sum_abs[row_index] += diff;
+            row_sum_sq[row_index] += diff * diff;
+        }
+    }
+    metrics.mean_abs = sum_abs / static_cast<double>(reference.data.size());
+    metrics.rmse = std::sqrt(sum_sq / static_cast<double>(reference.data.size()));
+    const double denom = std::sqrt(ref_sq) * std::sqrt(cand_sq);
+    metrics.cosine_defined = denom > 0.0 && std::isfinite(denom);
+    metrics.cosine = metrics.cosine_defined ? dot / denom : 0.0;
+    metrics.reference0 = reference.data[0];
+    metrics.candidate0 = candidate.data[0];
+    RequireOrThrow(kLogitProbeIndex < reference.data.size(), "Logit probe index is out of range");
+    metrics.reference_probe = reference.data[kLogitProbeIndex];
+    metrics.candidate_probe = candidate.data[kLogitProbeIndex];
+
+    if (has_rows) {
+        metrics.row_metrics.reserve(row_count);
+        for (size_t row = 0; row < row_count; ++row) {
+            RowDiffMetrics row_metrics;
+            row_metrics.row_index = row;
+            row_metrics.batch = row / sequence_length;
+            row_metrics.sequence = row % sequence_length;
+            row_metrics.mean_abs = row_sum_abs[row] / static_cast<double>(vocab_size);
+            row_metrics.rmse = std::sqrt(row_sum_sq[row] / static_cast<double>(vocab_size));
+            const size_t row_begin = row * vocab_size;
+            for (size_t vocab = 0; vocab < vocab_size; ++vocab) {
+                const size_t index = row_begin + vocab;
+                const double ref = reference.data[index];
+                const double cand = candidate.data[index];
+                const bool nonfinite = !std::isfinite(ref) || !std::isfinite(cand);
+                const double diff = nonfinite ? std::numeric_limits<double>::infinity() : std::abs(ref - cand);
+                row_metrics.max_abs = std::max(row_metrics.max_abs, diff);
+                if (nonfinite || diff > tolerance) {
+                    ++row_metrics.count_gt_tolerance;
+                }
+            }
+            if (row_metrics.count_gt_tolerance > 0) {
+                ++metrics.rows_with_gt_tolerance;
+            }
+            if (row_metrics.count_gt_tolerance == vocab_size) {
+                ++metrics.rows_with_full_vocab_gt_tolerance;
+            }
+            metrics.row_metrics.push_back(row_metrics);
+        }
+    }
+    return metrics;
+}
+
+void LogTopRows(const std::string &label, std::vector<RowDiffMetrics> rows, std::string_view sort_key,
+                size_t vocab_size) {
+    if (sort_key == "count") {
+        std::sort(rows.begin(), rows.end(), [](const RowDiffMetrics &a, const RowDiffMetrics &b) {
+            if (a.count_gt_tolerance != b.count_gt_tolerance) {
+                return a.count_gt_tolerance > b.count_gt_tolerance;
+            }
+            return a.max_abs > b.max_abs;
+        });
+    } else {
+        std::sort(rows.begin(), rows.end(), [](const RowDiffMetrics &a, const RowDiffMetrics &b) {
+            if (a.max_abs != b.max_abs) {
+                return a.max_abs > b.max_abs;
+            }
+            return a.count_gt_tolerance > b.count_gt_tolerance;
+        });
+    }
+
+    const size_t limit = std::min<size_t>(10, rows.size());
+    for (size_t rank = 0; rank < limit; ++rank) {
+        const auto &row = rows[rank];
+        LOG(INFO) << "LOGITS_ROW_TOP label=" << label
+                  << " sort=" << sort_key
+                  << " rank=" << rank
+                  << " batch=" << row.batch
+                  << " sequence=" << row.sequence
+                  << " max_abs=" << row.max_abs
+                  << " mean_abs=" << row.mean_abs
+                  << " rmse=" << row.rmse
+                  << " count_gt_tolerance=" << row.count_gt_tolerance
+                  << " full_vocab_gt=" << (row.count_gt_tolerance == vocab_size);
+    }
+}
+
+void LogLogitsComparison(const std::string &label, const LogitsComparisonMetrics &metrics, float tolerance) {
+    const size_t vocab_size = metrics.row_metrics.empty() ? 0 : metrics.elements / metrics.row_metrics.size();
+    LOG(INFO) << "LOGITS_FULL_COMPARE label=" << label
+              << " tolerance=" << tolerance
+              << " elements=" << metrics.elements
+              << " first_mismatch=" << (metrics.has_mismatch ? std::to_string(metrics.first_mismatch) : std::string("none"))
+              << " first_mismatch_batch=" << metrics.first_mismatch_batch
+              << " first_mismatch_sequence=" << metrics.first_mismatch_sequence
+              << " first_mismatch_vocab=" << metrics.first_mismatch_vocab
+              << " max_abs=" << metrics.max_abs
+              << " mean_abs=" << metrics.mean_abs
+              << " rmse=" << metrics.rmse
+              << " count_gt_1e3=" << metrics.count_gt_tolerance
+              << " rows_with_gt_1e3=" << metrics.rows_with_gt_tolerance
+              << " rows_with_full_vocab_gt_1e3=" << metrics.rows_with_full_vocab_gt_tolerance
+              << " reference_nan_count=" << metrics.reference_nan_count
+              << " candidate_nan_count=" << metrics.candidate_nan_count
+              << " reference_inf_count=" << metrics.reference_inf_count
+              << " candidate_inf_count=" << metrics.candidate_inf_count
+              << " cosine=" << (metrics.cosine_defined ? std::to_string(metrics.cosine) : std::string("undefined"))
+              << " ref0=" << metrics.reference0
+              << " candidate0=" << metrics.candidate0
+              << " diff0=" << std::abs(metrics.reference0 - metrics.candidate0)
+              << " ref385973=" << metrics.reference_probe
+              << " candidate385973=" << metrics.candidate_probe
+              << " diff385973=" << std::abs(metrics.reference_probe - metrics.candidate_probe);
+    for (const auto &row : metrics.row_metrics) {
+        LOG(INFO) << "LOGITS_ROW_COMPARE label=" << label
+                  << " batch=" << row.batch
+                  << " sequence=" << row.sequence
+                  << " max_abs=" << row.max_abs
+                  << " mean_abs=" << row.mean_abs
+                  << " rmse=" << row.rmse
+                  << " count_gt_tolerance=" << row.count_gt_tolerance
+                  << " full_vocab_gt=" << (vocab_size != 0 && row.count_gt_tolerance == vocab_size);
+    }
+    LogTopRows(label, metrics.row_metrics, "count", vocab_size);
+    LogTopRows(label, metrics.row_metrics, "max_abs", vocab_size);
+}
+
+std::string CudaRuntimeVersionString() {
+#ifdef USE_CUDA
+    int version = 0;
+    const auto status = cudaRuntimeGetVersion(&version);
+    if (status != cudaSuccess) {
+        return std::string("unavailable: ") + cudaGetErrorString(status);
+    }
+    return std::to_string(version);
+#else
+    return "not_built_with_cuda";
+#endif
+}
+
+std::string GpuNameString(const Device &device) {
+#ifdef USE_CUDA
+    if (!device.IsCUDA()) {
+        return "not_cuda_device";
+    }
+    cudaDeviceProp prop{};
+    const auto status = cudaGetDeviceProperties(&prop, device.Index());
+    if (status != cudaSuccess) {
+        return std::string("unavailable: ") + cudaGetErrorString(status);
+    }
+    return prop.name;
+#else
+    (void)device;
+    return "not_built_with_cuda";
+#endif
+}
+
+std::string CublasVersionString() {
+#ifdef USE_CUDA
+    cublasHandle_t handle = nullptr;
+    const auto create_status = cublasCreate(&handle);
+    if (create_status != CUBLAS_STATUS_SUCCESS) {
+        return "unavailable: cublasCreate failed with code " + std::to_string(static_cast<int>(create_status));
+    }
+    int version = 0;
+    const auto version_status = cublasGetVersion(handle, &version);
+    cublasDestroy(handle);
+    if (version_status != CUBLAS_STATUS_SUCCESS) {
+        return "unavailable: cublasGetVersion failed with code " + std::to_string(static_cast<int>(version_status));
+    }
+    return std::to_string(version);
+#else
+    return "not_built_with_cuda";
+#endif
+}
+
+std::string BuildTypeString() {
+#ifdef NDEBUG
+    return "Release_or_NDEBUG";
+#else
+    return "Debug_or_no_NDEBUG";
+#endif
+}
+
+std::string UseCudaString() {
+#ifdef USE_CUDA
+    return "ON";
+#else
+    return "OFF";
+#endif
+}
+
 } // namespace
 
 class GPT2TrainingTest : public ::testing::Test {
@@ -301,6 +1168,9 @@ protected:
         input_bin = "../../Data/tinyshakespeare/tiny_shakespeare_train.bin";
         tokenizer_bin = "../../Data/gpt2_tokenizer.bin";
         logits_reference = "../../Data/gpt2_logits_reference.bin";
+        tied_logits_reference = "../../Data/gpt2_logits_reference_tied_10_updates.bin";
+        tied_logits_reference_generated = "../../Data/gpt2_logits_reference_tied_10_updates.bin.generated";
+        tied_logits_reference_meta_generated = "../../Data/gpt2_logits_reference_tied_10_updates.meta.txt.generated";
 
         device_flag = "cuda";
         model_name = "gpt2";
@@ -589,6 +1459,189 @@ protected:
                   << " first_different_stage=" << first_different_stage;
     }
     
+
+
+    void ConfigureGradAccumulation() {
+        const auto tokens_per_fwdbwd = batch_size * sequence_length;
+        grad_accum_steps = total_batch_size / tokens_per_fwdbwd;
+        CHECK_GT(grad_accum_steps, 0);
+        CHECK_EQ(grad_accum_steps, 2) << "GPT-2 tied reference semantics currently expect two microbatches";
+    }
+
+    float RunTrainingUpdate(int update_index, bool emit_logs) {
+        auto train_iter = train_loader->begin();
+        optimizer->ZeroGrad();
+        float lossf = 0.0f;
+
+        for (int micro_step = 0; micro_step < grad_accum_steps; ++micro_step) {
+            auto [x, y] = *train_iter;
+            ++train_iter;
+            x = std::make_shared<Tensor>(x->To(device));
+            y = std::make_shared<Tensor>(y->To(device));
+
+            auto outputs = model->Forward({x, y});
+            auto update_logits = outputs[0];
+            CHECK(update_logits != nullptr) << "Training update logits are null";
+
+            auto loss = loss_fn->Forward({update_logits, y})[0];
+            auto loss_cpu = loss->To(Device());
+            lossf += static_cast<const float *>(loss_cpu.DataPtr())[0] / grad_accum_steps;
+
+            // Current accumulation semantics intentionally match the legacy test: the logged loss is averaged,
+            // but backward uses the unscaled microbatch loss. Gradient scaling is a separate follow-up decision.
+            loss->Backward();
+        }
+
+        optimizer->Step();
+        if (emit_logs) {
+            LOG(INFO) << "TIED_REF_UPDATE update=" << update_index << " loss=" << lossf
+                      << " grad_accum_steps=" << grad_accum_steps;
+        }
+        return lossf;
+    }
+
+    std::shared_ptr<Tensor> RunForwardOnly(int batch_offset, bool emit_logs) {
+        auto train_iter = train_loader->begin();
+        for (int i = 0; i < batch_offset; ++i) {
+            ++train_iter;
+        }
+        auto [x, y] = *train_iter;
+        x = std::make_shared<Tensor>(x->To(device));
+        y = std::make_shared<Tensor>(y->To(device));
+
+        auto outputs = model->Forward({x, y});
+        logits = outputs[0];
+        CHECK(logits != nullptr) << "Final forward logits are null";
+        if (emit_logs) {
+            const auto summary = SummarizeFloatTensor(*logits, kLogitProbeIndex);
+            LOG(INFO) << "TIED_REF_FINAL_FORWARD batch_offset=" << batch_offset
+                      << " dims=" << summary.dims << " elements=" << summary.num_elements
+                      << " logits0=" << CopyTensorToLogitsBinary(*logits).data[0]
+                      << " logits385973=" << summary.sample;
+        }
+        return logits;
+    }
+
+    std::shared_ptr<Tensor> RunTiedReferenceTrainingAndForward(bool emit_logs) {
+        ConfigureGradAccumulation();
+        for (int update = 0; update < num_reference_optimizer_updates; ++update) {
+            (void)RunTrainingUpdate(update, emit_logs);
+        }
+        return RunForwardOnly(reference_forward_batch_offset, emit_logs);
+    }
+
+    void AssertTiedWeightsAndOptimizerDedup() {
+        const auto snapshot = GetWeightTyingSnapshot(*model);
+        EXPECT_EQ(snapshot.wte.get(), snapshot.lm_head.get()) << "Expected tied weights to share Tensor object";
+        EXPECT_EQ(snapshot.wte->DataPtr(), snapshot.lm_head->DataPtr()) << "Expected tied weights to share data";
+
+        const auto params = model->Parameters();
+        EXPECT_EQ(CountPointerOccurrences(params, snapshot.wte), 1)
+            << "Shared weight should appear once in optimizer parameter list";
+        EXPECT_EQ(CountDataPtrOccurrences(params, snapshot.wte->DataPtr()), 1)
+            << "Shared weight data should appear once in optimizer parameter list";
+    }
+
+    std::string HashReferenceTrainingMicrobatches() {
+        ConfigureGradAccumulation();
+        std::vector<uint8_t> bytes;
+        AppendPod(bytes, num_reference_optimizer_updates);
+        AppendPod(bytes, grad_accum_steps);
+        auto train_iter = train_loader->begin();
+        for (int micro_step = 0; micro_step < grad_accum_steps; ++micro_step) {
+            auto [x, y] = *train_iter;
+            ++train_iter;
+            AppendStringRecord(bytes, "microbatch");
+            AppendPod(bytes, micro_step);
+            AppendTensorRecord(bytes, "input", *x);
+            AppendTensorRecord(bytes, "target", *y);
+        }
+        return Sha256Bytes(bytes);
+    }
+
+    std::pair<std::string, std::string> HashReferenceForwardBatch() {
+        auto train_iter = train_loader->begin();
+        for (int i = 0; i < reference_forward_batch_offset; ++i) {
+            ++train_iter;
+        }
+        auto [x, y] = *train_iter;
+        return {HashTensorRecord("final_forward_input", *x), HashTensorRecord("final_forward_target", *y)};
+    }
+
+    ReferenceTraceMetadata CollectReferenceTraceMetadata() {
+        ReferenceTraceMetadata trace;
+        trace.git = ReadGitMetadata();
+        trace.model_checkpoint_path = std::filesystem::weakly_canonical(llmc_filepath).string();
+        trace.model_checkpoint_sha256 = Sha256File(llmc_filepath);
+        trace.training_dataset_path = std::filesystem::weakly_canonical(input_bin).string();
+        trace.training_dataset_sha256 = Sha256File(input_bin);
+        trace.tokenizer_path = std::filesystem::weakly_canonical(tokenizer_bin).string();
+        trace.tokenizer_sha256 = Sha256File(tokenizer_bin);
+        trace.training_microbatches_sha256 = HashReferenceTrainingMicrobatches();
+        trace.training_microbatch_count = grad_accum_steps;
+        trace.training_microbatches_repeated_use_count = num_reference_optimizer_updates;
+        const auto [final_input_sha256, final_target_sha256] = HashReferenceForwardBatch();
+        trace.final_forward_input_sha256 = final_input_sha256;
+        trace.final_forward_target_sha256 = final_target_sha256;
+        return trace;
+    }
+
+    std::string BuildReferenceMetadata(const LogitsBinary &generated_logits, const std::string &output_path,
+                                       const std::string &reference_sha256,
+                                       const ReferenceTraceMetadata &trace) const {
+        const auto snapshot = GetWeightTyingSnapshot(*model);
+        const auto params = model->Parameters();
+        std::ostringstream metadata;
+        metadata << "git_commit=" << trace.git.commit << "\n";
+        metadata << "git_branch=" << trace.git.branch << "\n";
+        metadata << "working_tree_dirty=" << (trace.git.working_tree_dirty ? "true" : "false") << "\n";
+        metadata << "unstaged_diff_sha256=" << trace.git.unstaged_diff_sha256 << "\n";
+        metadata << "staged_diff_sha256=" << trace.git.staged_diff_sha256 << "\n";
+        metadata << "git_status_porcelain_sha256=" << trace.git.status_porcelain_sha256 << "\n";
+        metadata << "generated_at=" << CurrentDateTimeString() << "\n";
+        metadata << "cuda_runtime_version=" << CudaRuntimeVersionString() << "\n";
+        metadata << "gpu_name=" << GpuNameString(device) << "\n";
+        metadata << "cublas_version=" << CublasVersionString() << "\n";
+        metadata << "build_type=" << BuildTypeString() << "\n";
+        metadata << "use_cuda=" << UseCudaString() << "\n";
+        metadata << "model_checkpoint_path=" << trace.model_checkpoint_path << "\n";
+        metadata << "model_checkpoint_sha256=" << trace.model_checkpoint_sha256 << "\n";
+        metadata << "training_dataset_path=" << trace.training_dataset_path << "\n";
+        metadata << "training_dataset_sha256=" << trace.training_dataset_sha256 << "\n";
+        metadata << "tokenizer_path=" << trace.tokenizer_path << "\n";
+        metadata << "tokenizer_sha256=" << trace.tokenizer_sha256 << "\n";
+        metadata << "training_microbatches_sha256=" << trace.training_microbatches_sha256 << "\n";
+        metadata << "training_microbatch_count=" << trace.training_microbatch_count << "\n";
+        metadata << "training_microbatches_repeated_use_count=" << trace.training_microbatches_repeated_use_count << "\n";
+        metadata << "final_forward_batch_offset=" << reference_forward_batch_offset << "\n";
+        metadata << "final_forward_input_sha256=" << trace.final_forward_input_sha256 << "\n";
+        metadata << "final_forward_target_sha256=" << trace.final_forward_target_sha256 << "\n";
+        metadata << "batch_size=" << batch_size << "\n";
+        metadata << "sequence_length=" << sequence_length << "\n";
+        metadata << "vocab_size=" << generated_logits.dims.at(2) << "\n";
+        metadata << "total_batch_size=" << total_batch_size << "\n";
+        metadata << "grad_accum_steps=" << grad_accum_steps << "\n";
+        metadata << "num_optimizer_updates=" << num_reference_optimizer_updates << "\n";
+        metadata << "learning_rate=" << learning_rate << "\n";
+        metadata << "optimizer=SGD\n";
+        metadata << "weight_tying_same_tensor=" << (snapshot.wte.get() == snapshot.lm_head.get()) << "\n";
+        metadata << "weight_tying_same_data=" << (snapshot.wte->DataPtr() == snapshot.lm_head->DataPtr()) << "\n";
+        metadata << "optimizer_param_total=" << params.size() << "\n";
+        metadata << "optimizer_unique_tensor_objects=" << CountUniqueTensorObjects(params) << "\n";
+        metadata << "optimizer_unique_data_ptrs=" << CountUniqueDataPtrs(params) << "\n";
+        metadata << "reference_format_magic=" << kReferenceMagic << "\n";
+        metadata << "reference_format_version=" << kReferenceVersion << "\n";
+        metadata << "reference_format_dtype=float32\n";
+        metadata << "reference_shape=" << DimsToString(generated_logits.dims) << "\n";
+        metadata << "reference_dtype=float32\n";
+        metadata << "reference_file=" << output_path << "\n";
+        metadata << "reference_file_sha256=" << reference_sha256 << "\n";
+        metadata << "loss_logging=loss_sum_divided_by_grad_accum_steps\n";
+        metadata << "backward_loss_scaling=unscaled_microbatch_loss\n";
+        metadata << "generation_mode=candidate_generated_only\n";
+        return metadata.str();
+    }
+
     std::unique_ptr<GPT2> model;
     std::unique_ptr<DataLoader> train_loader;
     std::unique_ptr<optimizers::SGD> optimizer;
@@ -602,12 +1655,17 @@ protected:
     std::string input_bin;
     std::string tokenizer_bin;
     std::string logits_reference;
+    std::string tied_logits_reference;
+    std::string tied_logits_reference_generated;
+    std::string tied_logits_reference_meta_generated;
     std::string device_flag;
     std::string model_name;
     int batch_size = 2;
     int sequence_length = 64;    
     int total_batch_size = 256;
     int num_iteration = 10;    // 迭代次数
+    int num_reference_optimizer_updates = 10;
+    int reference_forward_batch_offset = 0;
     int text_length = 64;    // 生成文本长度
     int freq_generate_txt = 10;
     float learning_rate = 1e-4;
@@ -736,7 +1794,126 @@ TEST_F(GPT2TrainingTest, TrainingStageDiagnostics) {
     CompareDiagnosticRuns(first_run, second_run);
 }
 
-TEST_F(GPT2TrainingTest, LogitsConsistency) {
+
+TEST_F(GPT2TrainingTest, LogitsConsistencyTiedWeights) {
+    AssertTiedWeightsAndOptimizerDedup();
+
+    if (!std::filesystem::exists(tied_logits_reference)) {
+        GTEST_SKIP() << "Missing tied-weight GPT-2 logits reference: " << tied_logits_reference
+                     << ". Generate a candidate explicitly with: cd build/Release && "
+                     << "TINY_GENERATE_GPT2_REFERENCE=1 ./test_gpt2 "
+                     << "--gtest_filter=GPT2TrainingTest.GenerateTiedWeightsReference. "
+                     << "The generator writes .generated files and never overwrites the checked-in reference.";
+    }
+
+    auto final_logits = RunTiedReferenceTrainingAndForward(true);
+    auto current = CopyTensorToLogitsBinary(*final_logits);
+    LogitsBinary reference;
+    try {
+        reference = ReadLogitsBinaryFile(tied_logits_reference);
+    } catch (const std::exception &e) {
+        FAIL() << e.what();
+    }
+    ASSERT_EQ(reference.dims, current.dims) << "Reference dims do not match final forward logits";
+
+    const auto metrics = CompareLogitsFull(reference, current, kDiagnosticTolerance);
+    LogLogitsComparison("tied_weights_10_updates", metrics, kDiagnosticTolerance);
+    EXPECT_EQ(metrics.reference_nan_count, 0);
+    EXPECT_EQ(metrics.candidate_nan_count, 0);
+    EXPECT_EQ(metrics.reference_inf_count, 0);
+    EXPECT_EQ(metrics.candidate_inf_count, 0);
+    EXPECT_EQ(metrics.count_gt_tolerance, 0)
+        << "Tied-weight logits differ from reference; see LOGITS_FULL_COMPARE metrics above";
+}
+
+TEST_F(GPT2TrainingTest, GenerateTiedWeightsReference) {
+    if (!EnvFlagEnabled("TINY_GENERATE_GPT2_REFERENCE")) {
+        GTEST_SKIP() << "Set TINY_GENERATE_GPT2_REFERENCE=1 to write tied-weight GPT-2 reference .generated files";
+    }
+    ASSERT_FALSE(EnvFlagEnabled("TINY_GENERATE_GPT2_REFERENCE_FORMAL"))
+        << "Formal reference generation/promotion is intentionally not implemented here. It must require a clean "
+        << "working tree and committed generator code before writing a non-.generated reference.";
+
+    AssertTiedWeightsAndOptimizerDedup();
+    const std::string output_path = EnvOrDefault("TINY_GPT2_REFERENCE_OUTPUT", tied_logits_reference_generated);
+    const std::string meta_path = EnvOrDefault("TINY_GPT2_REFERENCE_META", tied_logits_reference_meta_generated);
+    const bool overwrite = EnvFlagEnabled("TINY_OVERWRITE_GPT2_REFERENCE_GENERATED");
+    ASSERT_TRUE(EndsWith(output_path, ".generated"))
+        << "Candidate logits output must end with .generated: " << output_path;
+    ASSERT_TRUE(EndsWith(meta_path, ".generated"))
+        << "Candidate metadata output must end with .generated: " << meta_path;
+    ASSERT_FALSE(std::filesystem::exists(tied_logits_reference))
+        << "Formal tied-weight reference already exists: " << tied_logits_reference
+        << ". This generator only creates .generated candidates.";
+
+    ReferenceTraceMetadata trace;
+    try {
+        trace = CollectReferenceTraceMetadata();
+    } catch (const std::exception &e) {
+        FAIL() << "Failed to collect reference trace metadata before writing outputs: " << e.what();
+    }
+
+    auto final_logits = RunTiedReferenceTrainingAndForward(true);
+    const auto generated = CopyTensorToLogitsBinary(*final_logits);
+    ReferenceWriteResult written;
+    try {
+        written = WriteLogitsBinaryFileAtomic(output_path, generated, overwrite);
+    } catch (const std::exception &e) {
+        FAIL() << e.what();
+    }
+
+    const auto metadata_text = BuildReferenceMetadata(generated, output_path, written.sha256, trace);
+    try {
+        WriteTextFileAtomic(meta_path, metadata_text, overwrite);
+    } catch (const std::exception &e) {
+        FAIL() << e.what();
+    }
+    const auto metadata_sha256 = Sha256File(meta_path);
+
+    LOG(INFO) << "TIED_REFERENCE_GENERATED logits=" << output_path << " metadata=" << meta_path
+              << " sha256=" << written.sha256 << " metadata_sha256=" << metadata_sha256;
+}
+
+TEST_F(GPT2TrainingTest, TiedReferenceCandidatePairwiseDiagnostics) {
+    const std::vector<std::string> candidate_paths = {
+        "../../gpt2_tied_ref_run1.bin.generated",
+        "../../gpt2_tied_ref_run2.bin.generated",
+        "../../gpt2_tied_ref_run3.bin.generated",
+    };
+    for (const auto &path : candidate_paths) {
+        if (!std::filesystem::exists(path)) {
+            GTEST_SKIP() << "Missing generated candidate for pairwise diagnostics: " << path;
+        }
+    }
+
+    std::vector<LogitsBinary> candidates;
+    candidates.reserve(candidate_paths.size());
+    for (const auto &path : candidate_paths) {
+        try {
+            candidates.push_back(ReadLogitsBinaryFileAuto(path));
+        } catch (const std::exception &e) {
+            FAIL() << e.what();
+        }
+    }
+
+    for (size_t i = 0; i < candidates.size(); ++i) {
+        for (size_t j = i + 1; j < candidates.size(); ++j) {
+            const auto metrics = CompareLogitsFull(candidates[i], candidates[j], kDiagnosticTolerance);
+            const std::string label = "run" + std::to_string(i + 1) + "_vs_run" + std::to_string(j + 1);
+            LogLogitsComparison(label, metrics, kDiagnosticTolerance);
+            EXPECT_EQ(metrics.reference_nan_count, 0) << label;
+            EXPECT_EQ(metrics.candidate_nan_count, 0) << label;
+            EXPECT_EQ(metrics.reference_inf_count, 0) << label;
+            EXPECT_EQ(metrics.candidate_inf_count, 0) << label;
+        }
+    }
+}
+
+
+// Historical reference check. The checked-in reference was generated from the old split-weight
+// device-move behavior, so it is not a default correctness gate for tied-weight GPT-2.
+// Run explicitly with --gtest_also_run_disabled_tests and this disabled test filter if needed.
+TEST_F(GPT2TrainingTest, DISABLED_LogitsConsistencyLegacySplitWeights) {
     const auto tokens_per_fwdbwd = batch_size * sequence_length;    // 梯度累积步数
     grad_accum_steps = total_batch_size / tokens_per_fwdbwd;
     
