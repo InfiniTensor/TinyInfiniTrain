@@ -18,7 +18,7 @@ void AdamAccumulateGrad(const std::shared_ptr<Tensor> &grad, const std::shared_p
     // TODO：实现Adam优化器的梯度累积和参数更新
     // REF:
     // =================================== 作业 ===================================
-      CHECK_EQ(grad->NumElements(), param->NumElements());
+    CHECK_EQ(grad->NumElements(), param->NumElements());
     CHECK_EQ(m->NumElements(), param->NumElements());
     CHECK_EQ(v->NumElements(), param->NumElements());
 
