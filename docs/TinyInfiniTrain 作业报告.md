@@ -2,6 +2,7 @@
 
 ## 一、test 通过截图
 
+
 ## 二、作业步骤
 
 > 将代码填入下面代码块中指定位置，并详细描述完成该作业的解决思路和遇到的问题。
@@ -20,6 +21,7 @@ std::vector<std::shared_ptr<Tensor>> Neg::Forward(const std::vector<std::shared_
     // TODO：通过Dispatcher获取设备专属kernel，对输入张量进行取反操作
     // HINT: 依赖test_dispatcher，kernel实现已给出
     // =================================== 作业 ===================================
+
 }
 
 std::vector<std::shared_ptr<Tensor>> Neg::Backward(const std::vector<std::shared_ptr<Tensor>> &grad_outputs) {
@@ -27,6 +29,7 @@ std::vector<std::shared_ptr<Tensor>> Neg::Backward(const std::vector<std::shared
     // TODO：通过Dispatcher获取设备专属的反向传播kernel，计算梯度
     // HINT: 依赖test_dispatcher，kernel实现已给出
     // =================================== 作业 ===================================
+
 }
 ```
 
@@ -309,4 +312,3 @@ void Tokenizer::GenerateText(infini_train::nn::Module &model, uint32_t batch_siz
 
 
 #### 遇到问题
-
