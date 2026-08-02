@@ -4,6 +4,7 @@ build/
 Data/*
 !Data/gpt2_logits_reference.bin
 !Data/gpt2_logits_reference_tied_10_updates.bin
+!Data/gpt2_logits_reference_tied_10_updates.meta.txt
 
 # GPT-2 reference generation candidates and scratch outputs.
 Data/*.generated
