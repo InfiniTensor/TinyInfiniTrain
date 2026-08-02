@@ -2425,29 +2425,38 @@ protected:
                   << " col=" << (has_first_mismatch ? std::to_string(first_mismatch_col) : std::string("none"));
     }
 
-    template <typename RunOnceT>
-    void LogRepeatedTensorResultsIncremental(const std::string &label, int runs, RunOnceT run_once) {
-        ASSERT_GE(runs, 2);
-        auto reference = run_once();
+    struct RepeatedTensorRunSummary {
         int first_diff_iter = -1;
         double max_abs = 0.0;
+        size_t max_bitwise_mismatch_count = 0;
+    };
+    template <typename RunOnceT>
+    RepeatedTensorRunSummary LogRepeatedTensorResultsIncremental(const std::string &label, int runs,
+                                                                 RunOnceT run_once) {
+        CHECK_GE(runs, 2);
+        auto reference = run_once();
+        RepeatedTensorRunSummary summary;
         for (int i = 1; i < runs; ++i) {
             auto current = run_once();
             const auto metrics = CompareLogitsPayloads(reference, current, 0.0f);
             EXPECT_FALSE(TensorHasNonFiniteDiffInput(metrics)) << label << " iteration " << i;
-            if (metrics.count_bitwise_mismatch != 0 && first_diff_iter < 0) {
-                first_diff_iter = i;
+            if (metrics.count_bitwise_mismatch != 0 && summary.first_diff_iter < 0) {
+                summary.first_diff_iter = i;
             }
-            max_abs = std::max(max_abs, metrics.max_abs);
+            summary.max_abs = std::max(summary.max_abs, metrics.max_abs);
+            summary.max_bitwise_mismatch_count = std::max(summary.max_bitwise_mismatch_count,
+                                                          metrics.count_bitwise_mismatch);
             const std::string iter_label = label + ".iter" + std::to_string(i);
             LogTensorDiffComparison(iter_label, metrics, 0.0f);
             LogMatrixRowDiffSummary(iter_label, reference, current, 0.0f);
         }
         LOG(INFO) << "DETERMINISM_RESULT label=" << label
                   << " runs=" << runs
-                  << " bitwise_stable=" << (first_diff_iter < 0)
-                  << " first_diff_iter=" << first_diff_iter
-                  << " max_abs=" << max_abs;
+                  << " bitwise_stable=" << (summary.first_diff_iter < 0)
+                  << " first_diff_iter=" << summary.first_diff_iter
+                  << " max_abs=" << summary.max_abs
+                  << " max_bitwise_mismatch_count=" << summary.max_bitwise_mismatch_count;
+        return summary;
     }
 
     void ReleaseFixtureTrainingStateForStandaloneKernelTest() {
@@ -2488,6 +2497,248 @@ protected:
         return CopyTensorToLogitsBinary(*grad_buffer);
     }
 
+    std::unordered_map<int64_t, size_t> CountTokens(const std::vector<int64_t> &input_values) {
+        std::unordered_map<int64_t, size_t> counts;
+        for (const int64_t token : input_values) {
+            ++counts[token];
+        }
+        return counts;
+    }
+
+    std::vector<std::pair<int64_t, size_t>> SortedTokenCounts(const std::vector<int64_t> &input_values) {
+        auto counts = CountTokens(input_values);
+        std::vector<std::pair<int64_t, size_t>> sorted(counts.begin(), counts.end());
+        std::sort(sorted.begin(), sorted.end(), [](const auto &lhs, const auto &rhs) {
+            return lhs.first < rhs.first;
+        });
+        return sorted;
+    }
+
+    void LogTokenCounts(const std::string &label, const std::vector<int64_t> &input_values) {
+        const auto sorted = SortedTokenCounts(input_values);
+        size_t repeated_token_rows = 0;
+        size_t repeated_index_instances = 0;
+        size_t max_repeat = 0;
+        int64_t max_repeat_token = -1;
+        for (const auto &[token, count] : sorted) {
+            if (count > 1) {
+                ++repeated_token_rows;
+                repeated_index_instances += count;
+            }
+            if (count > max_repeat) {
+                max_repeat = count;
+                max_repeat_token = token;
+            }
+        }
+        LOG(INFO) << "EMBEDDING_TOKEN_COUNTS_SUMMARY label=" << label
+                  << " total_tokens=" << input_values.size()
+                  << " unique_token_rows=" << sorted.size()
+                  << " repeated_token_rows=" << repeated_token_rows
+                  << " repeated_index_instances=" << repeated_index_instances
+                  << " max_repeat_token=" << max_repeat_token
+                  << " max_repeat=" << max_repeat;
+        for (const auto &[token, count] : sorted) {
+            LOG(INFO) << "EMBEDDING_TOKEN_COUNT label=" << label
+                      << " token=" << token
+                      << " count=" << count;
+        }
+    }
+
+    std::vector<int64_t> MakeUniqueTokenValues(size_t num_tokens, int64_t vocab_size) {
+        CHECK_LE(num_tokens + 1024, static_cast<size_t>(vocab_size));
+        std::vector<int64_t> values(num_tokens);
+        for (size_t i = 0; i < num_tokens; ++i) {
+            values[i] = static_cast<int64_t>(1024 + i);
+        }
+        return values;
+    }
+
+    std::vector<int64_t> MakeRepeatedTokenValues(size_t num_tokens, int64_t vocab_size) {
+        CHECK_GE(vocab_size, 32);
+        std::vector<int64_t> values(num_tokens);
+        for (size_t i = 0; i < num_tokens; ++i) {
+            values[i] = static_cast<int64_t>((i * 17 + (i % 5) * 3) % 32);
+        }
+        return values;
+    }
+
+    std::vector<int64_t> MakeIdenticalTokenValues(size_t num_tokens, int64_t token_id) {
+        return std::vector<int64_t>(num_tokens, token_id);
+    }
+
+    LogitsBinary ComputeEmbeddingBackwardCpuReference(const std::vector<int64_t> &input_values,
+                                                      const LogitsBinary &grad_output_cpu_payload,
+                                                      const std::vector<int64_t> &weight_dims) {
+        CHECK_EQ(weight_dims.size(), 2);
+        const int64_t num_embeddings = weight_dims[0];
+        const int64_t embedding_dim = weight_dims[1];
+        CHECK_EQ(grad_output_cpu_payload.data.size(), input_values.size() * static_cast<size_t>(embedding_dim));
+        LogitsBinary result{.dims = weight_dims,
+                            .data = std::vector<float>(static_cast<size_t>(num_embeddings * embedding_dim), 0.0f)};
+        for (size_t i = 0; i < input_values.size(); ++i) {
+            const int64_t token = input_values[i];
+            if (token < 0 || token >= num_embeddings) {
+                continue;
+            }
+            for (int64_t dim = 0; dim < embedding_dim; ++dim) {
+                result.data[static_cast<size_t>(token * embedding_dim + dim)]
+                    += grad_output_cpu_payload.data[i * static_cast<size_t>(embedding_dim) + static_cast<size_t>(dim)];
+            }
+        }
+        return result;
+    }
+
+    void LogTokenGroupErrorSummary(const std::string &label, const LogitsBinary &lhs, const LogitsBinary &rhs,
+                                   const std::vector<std::pair<int64_t, size_t>> &token_counts) {
+        CHECK(lhs.dims == rhs.dims);
+        CHECK_EQ(lhs.dims.size(), 2);
+        const size_t embedding_dim = static_cast<size_t>(lhs.dims[1]);
+        struct GroupStats {
+            size_t rows = 0;
+            size_t elements = 0;
+            size_t count_bitwise_mismatch = 0;
+            double max_abs = 0.0;
+            double sum_abs = 0.0;
+            double sum_sq = 0.0;
+        };
+        GroupStats repeated;
+        GroupStats unique;
+        auto accumulate_row = [&](GroupStats &stats, int64_t token) {
+            CHECK_GE(token, 0);
+            CHECK_LT(token, lhs.dims[0]);
+            ++stats.rows;
+            for (size_t dim = 0; dim < embedding_dim; ++dim) {
+                const size_t index = static_cast<size_t>(token) * embedding_dim + dim;
+                const float lhs_value = lhs.data[index];
+                const float rhs_value = rhs.data[index];
+                const double diff = std::abs(static_cast<double>(lhs_value) - static_cast<double>(rhs_value));
+                stats.count_bitwise_mismatch += std::memcmp(&lhs_value, &rhs_value, sizeof(float)) != 0 ? 1 : 0;
+                stats.max_abs = std::max(stats.max_abs, diff);
+                stats.sum_abs += diff;
+                stats.sum_sq += diff * diff;
+                ++stats.elements;
+            }
+        };
+        for (const auto &[token, count] : token_counts) {
+            if (token < 0 || token >= lhs.dims[0]) {
+                continue;
+            }
+            if (count > 1) {
+                accumulate_row(repeated, token);
+            } else {
+                accumulate_row(unique, token);
+            }
+        }
+        auto log_group = [&](const char *kind, const GroupStats &stats) {
+            LOG(INFO) << "EMBEDDING_TOKEN_GROUP_COMPARE label=" << label
+                      << " kind=" << kind
+                      << " rows=" << stats.rows
+                      << " elements=" << stats.elements
+                      << " bitwise_mismatch_count=" << stats.count_bitwise_mismatch
+                      << " max_abs=" << stats.max_abs
+                      << " mean_abs=" << (stats.elements == 0 ? 0.0 : stats.sum_abs / static_cast<double>(stats.elements))
+                      << " rmse=" << (stats.elements == 0 ? 0.0 : std::sqrt(stats.sum_sq / static_cast<double>(stats.elements)));
+        };
+        log_group("repeated", repeated);
+        log_group("unique", unique);
+    }
+
+    double MeasureEmbeddingBackwardAverageMs(const std::vector<int64_t> &input_dims,
+                                             const std::vector<int64_t> &input_values,
+                                             const LogitsBinary &grad_output_cpu_payload, int warmup_runs,
+                                             int timed_runs) {
+#ifdef USE_CUDA
+        auto input_cpu = std::make_shared<Tensor>(input_dims, DataType::kINT64, Device(DeviceType::kCPU, 0));
+        std::memcpy(input_cpu->DataPtr(), input_values.data(), input_values.size() * sizeof(int64_t));
+        auto grad_output_cpu = std::make_shared<Tensor>(grad_output_cpu_payload.dims, DataType::kFLOAT32,
+                                                        Device(DeviceType::kCPU, 0));
+        std::memcpy(grad_output_cpu->DataPtr(), grad_output_cpu_payload.data.data(),
+                    grad_output_cpu_payload.data.size() * sizeof(float));
+        auto input = ToDiagnosticCudaTensor(input_cpu);
+        auto grad_output = ToDiagnosticCudaTensor(grad_output_cpu);
+        const auto &embedding_backward = Dispatcher::Instance().GetKernel({DeviceType::kCUDA, "EmbeddingBackward"});
+        for (int i = 0; i < warmup_runs; ++i) {
+            auto grad_weight = embedding_backward.Call<std::shared_ptr<Tensor>>(input, std::vector<int64_t>{50257, 768},
+                                                                                grad_output);
+            (void)grad_weight;
+        }
+        cudaDeviceSynchronize();
+        const auto start = std::chrono::steady_clock::now();
+        for (int i = 0; i < timed_runs; ++i) {
+            auto grad_weight = embedding_backward.Call<std::shared_ptr<Tensor>>(input, std::vector<int64_t>{50257, 768},
+                                                                                grad_output);
+            (void)grad_weight;
+        }
+        cudaDeviceSynchronize();
+        const auto end = std::chrono::steady_clock::now();
+        const double elapsed_ms = std::chrono::duration<double, std::milli>(end - start).count();
+        return elapsed_ms / static_cast<double>(timed_runs);
+#else
+        (void)input_dims;
+        (void)input_values;
+        (void)grad_output_cpu_payload;
+        (void)warmup_runs;
+        (void)timed_runs;
+        return -1.0;
+#endif
+    }
+
+    RepeatedTensorRunSummary LogEmbeddingCaseDiagnostics(const std::string &label,
+                                                         const std::vector<int64_t> &input_dims,
+                                                         const std::vector<int64_t> &input_values,
+                                                         const LogitsBinary &grad_output_payload, int runs) {
+        constexpr int64_t kVocabSize = 50257;
+        constexpr int64_t kHiddenSize = 768;
+        const std::vector<int64_t> weight_dims{kVocabSize, kHiddenSize};
+        const auto token_counts = SortedTokenCounts(input_values);
+        LogTokenCounts(label, input_values);
+        const auto cpu_reference = ComputeEmbeddingBackwardCpuReference(input_values, grad_output_payload, weight_dims);
+        const double average_ms = MeasureEmbeddingBackwardAverageMs(input_dims, input_values, grad_output_payload, 5, 30);
+        LOG(INFO) << "EMBEDDING_BACKWARD_PERF label=" << label
+                  << " average_ms=" << average_ms
+                  << " warmup_runs=5 timed_runs=30"
+                  << " shape_tokens=" << input_values.size()
+                  << " embedding_dim=" << kHiddenSize
+                  << " vocab_size=" << kVocabSize;
+
+        CHECK_GE(runs, 2);
+        auto first_cuda = RunEmbeddingWeightGradientOnce(input_dims, input_values, grad_output_payload);
+        auto first_cpu_metrics = CompareLogitsPayloads(cpu_reference, first_cuda, 0.0f);
+        LogTensorDiffComparison(label + ".cuda_vs_cpu.iter0", first_cpu_metrics, 0.0f);
+        LogMatrixRowDiffSummary(label + ".cuda_vs_cpu.iter0", cpu_reference, first_cuda, 0.0f);
+        LogTokenGroupErrorSummary(label + ".cuda_vs_cpu.iter0", cpu_reference, first_cuda, token_counts);
+
+        RepeatedTensorRunSummary summary;
+        for (int i = 1; i < runs; ++i) {
+            auto current_cuda = RunEmbeddingWeightGradientOnce(input_dims, input_values, grad_output_payload);
+            const auto cuda_vs_cuda = CompareLogitsPayloads(first_cuda, current_cuda, 0.0f);
+            EXPECT_FALSE(TensorHasNonFiniteDiffInput(cuda_vs_cuda)) << label << " cuda_vs_cuda iteration " << i;
+            if (cuda_vs_cuda.count_bitwise_mismatch != 0 && summary.first_diff_iter < 0) {
+                summary.first_diff_iter = i;
+            }
+            summary.max_abs = std::max(summary.max_abs, cuda_vs_cuda.max_abs);
+            summary.max_bitwise_mismatch_count = std::max(summary.max_bitwise_mismatch_count,
+                                                          cuda_vs_cuda.count_bitwise_mismatch);
+            const std::string cuda_label = label + ".cuda_vs_cuda.iter" + std::to_string(i);
+            LogTensorDiffComparison(cuda_label, cuda_vs_cuda, 0.0f);
+            LogMatrixRowDiffSummary(cuda_label, first_cuda, current_cuda, 0.0f);
+            LogTokenGroupErrorSummary(cuda_label, first_cuda, current_cuda, token_counts);
+
+            const auto cuda_vs_cpu = CompareLogitsPayloads(cpu_reference, current_cuda, 0.0f);
+            EXPECT_FALSE(TensorHasNonFiniteDiffInput(cuda_vs_cpu)) << label << " cuda_vs_cpu iteration " << i;
+            const std::string cpu_label = label + ".cuda_vs_cpu.iter" + std::to_string(i);
+            LogTensorDiffComparison(cpu_label, cuda_vs_cpu, 0.0f);
+            LogMatrixRowDiffSummary(cpu_label, cpu_reference, current_cuda, 0.0f);
+            LogTokenGroupErrorSummary(cpu_label, cpu_reference, current_cuda, token_counts);
+        }
+        LOG(INFO) << "DETERMINISM_RESULT label=" << label
+                  << " runs=" << runs
+                  << " bitwise_stable=" << (summary.first_diff_iter < 0)
+                  << " first_diff_iter=" << summary.first_diff_iter
+                  << " max_abs=" << summary.max_abs
+                  << " max_bitwise_mismatch_count=" << summary.max_bitwise_mismatch_count;
+        return summary;
+    }
     LogitsBinary RunEmbeddingWeightGradientOnce(const std::vector<int64_t> &input_dims,
                                                 const std::vector<int64_t> &input_values,
                                                 const LogitsBinary &grad_output_cpu_payload) {
@@ -2913,53 +3164,48 @@ TEST_F(GPT2TrainingTest, EmbeddingWeightGradientDeterminism) {
     ASSERT_TRUE(device.IsCUDA()) << "Embedding weight-gradient determinism diagnostic requires CUDA";
     ReleaseFixtureTrainingStateForStandaloneKernelTest();
 
-    constexpr int kRuns = 10;
+    constexpr int kRuns = 20;
     constexpr int64_t kHiddenSize = 768;
     constexpr int64_t kVocabSize = 50257;
     const std::vector<int64_t> input_dims{batch_size, sequence_length};
-    auto input_cpu = MakeDeterministicTokenTensor(input_dims, kVocabSize);
-    const auto *input_data = static_cast<const int64_t *>(input_cpu->DataPtr());
-    std::vector<int64_t> input_values(input_data, input_data + input_cpu->NumElements());
-    std::unordered_map<int64_t, size_t> token_counts;
-    for (const int64_t token : input_values) {
-        ++token_counts[token];
-    }
-    size_t repeated_token_rows = 0;
-    size_t repeated_index_instances = 0;
-    size_t max_repeat = 0;
-    int64_t max_repeat_token = -1;
-    for (const auto &[token, count] : token_counts) {
-        if (count > 1) {
-            ++repeated_token_rows;
-            repeated_index_instances += count;
-        }
-        if (count > max_repeat) {
-            max_repeat = count;
-            max_repeat_token = token;
-        }
-    }
-
+    const size_t num_tokens = static_cast<size_t>(batch_size * sequence_length);
     auto grad_output_cpu = MakeDeterministicFloatTensor({batch_size, sequence_length, kHiddenSize}, 1.0e-4f, 5);
     const auto grad_output_payload = CopyTensorToLogitsBinary(*grad_output_cpu);
-    input_cpu.reset();
     grad_output_cpu.reset();
+
+    struct EmbeddingCase {
+        std::string label;
+        std::vector<int64_t> input_values;
+        bool require_stable;
+    };
+    const std::vector<EmbeddingCase> cases = {
+        {.label = "EmbeddingWeightGradientDeterminism.unique_tokens",
+         .input_values = MakeUniqueTokenValues(num_tokens, kVocabSize),
+         .require_stable = true},
+        {.label = "EmbeddingWeightGradientDeterminism.repeated_tokens",
+         .input_values = MakeRepeatedTokenValues(num_tokens, kVocabSize),
+         .require_stable = false},
+        {.label = "EmbeddingWeightGradientDeterminism.all_identical_tokens",
+         .input_values = MakeIdenticalTokenValues(num_tokens, 5),
+         .require_stable = false},
+    };
 
     LOG(INFO) << "EMBEDDING_WEIGHT_GRAD_DETERMINISM_BEGIN runs=" << kRuns
               << " input_shape=" << DimsToString(input_dims)
               << " weight_shape=[" << kVocabSize << "x" << kHiddenSize << "]"
               << " grad_output_shape=[" << batch_size << "x" << sequence_length << "x" << kHiddenSize << "]"
-              << " unique_token_rows=" << token_counts.size()
-              << " repeated_token_rows=" << repeated_token_rows
-              << " repeated_index_instances=" << repeated_index_instances
-              << " max_repeat_token=" << max_repeat_token
-              << " max_repeat=" << max_repeat
-              << " kernel_uses_atomic_add=true";
+              << " cases=unique_tokens,repeated_tokens,all_identical_tokens";
 
-    LogRepeatedTensorResultsIncremental("EmbeddingWeightGradientDeterminism.full_vocab", kRuns, [&]() {
-        return RunEmbeddingWeightGradientOnce(input_dims, input_values, grad_output_payload);
-    });
+    for (const auto &embedding_case : cases) {
+        const auto summary = LogEmbeddingCaseDiagnostics(embedding_case.label, input_dims, embedding_case.input_values,
+                                                         grad_output_payload, kRuns);
+        if (embedding_case.require_stable) {
+            EXPECT_EQ(summary.first_diff_iter, -1)
+                << "Embedding backward without repeated token indices must be bitwise stable before attributing the "
+                << "nondeterminism to duplicate-index accumulation";
+        }
+    }
 }
-
 TEST_F(GPT2TrainingTest, SharedGradientAccumulationDeterminism) {
     ASSERT_TRUE(device.IsCUDA()) << "Shared gradient accumulation determinism diagnostic requires CUDA";
     ReleaseFixtureTrainingStateForStandaloneKernelTest();
@@ -3162,11 +3408,27 @@ TEST_F(GPT2TrainingTest, GenerateTiedWeightsReference) {
 }
 
 TEST_F(GPT2TrainingTest, TiedReferenceCandidatePairwiseDiagnostics) {
-    const std::vector<std::string> candidate_paths = {
+    std::vector<std::string> candidate_paths = {
         "../../gpt2_tied_ref_run1.bin.generated",
         "../../gpt2_tied_ref_run2.bin.generated",
         "../../gpt2_tied_ref_run3.bin.generated",
     };
+    if (const char *override_paths = std::getenv("TINY_GPT2_PAIRWISE_CANDIDATES")) {
+        candidate_paths.clear();
+        std::stringstream stream(override_paths);
+        std::string path;
+        while (std::getline(stream, path, ',')) {
+            path = TrimWhitespace(path);
+            if (!path.empty()) {
+                candidate_paths.push_back(path);
+            }
+        }
+        ASSERT_GE(candidate_paths.size(), 2) << "TINY_GPT2_PAIRWISE_CANDIDATES must contain at least two paths";
+    }
+    LOG(INFO) << "TIED_REFERENCE_PAIRWISE_CANDIDATE_COUNT count=" << candidate_paths.size();
+    for (size_t i = 0; i < candidate_paths.size(); ++i) {
+        LOG(INFO) << "TIED_REFERENCE_PAIRWISE_CANDIDATE index=" << i << " path=" << candidate_paths[i];
+    }
     for (const auto &path : candidate_paths) {
         if (!std::filesystem::exists(path)) {
             GTEST_SKIP() << "Missing generated candidate for pairwise diagnostics: " << path;

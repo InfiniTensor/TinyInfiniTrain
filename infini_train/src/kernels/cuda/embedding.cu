@@ -1,17 +1,13 @@
 #include "glog/logging.h"
 
+#include <limits>
+
+#include "infini_train/include/cuda_check.h"
 #include "infini_train/include/dispatcher.h"
 #include "infini_train/include/tensor.h"
 
 namespace infini_train::kernels::cuda {
 
-#define CUDA_CHECK(call)                                                                                               \
-    do {                                                                                                               \
-        cudaError_t status = call;                                                                                     \
-        if (status != cudaSuccess) {                                                                                   \
-            LOG(FATAL) << "CUDA Error: " << cudaGetErrorString(status) << " at " << __FILE__ << ":" << __LINE__;       \
-        }                                                                                                              \
-    } while (0)
 
 __global__ void EmbeddingForwardKernel(const int64_t *input, float *output, const float *weight, int batch_size,
                                        int max_seqlen, int embed_dim) {
@@ -50,20 +46,33 @@ std::shared_ptr<Tensor> EmbeddingForward(const std::shared_ptr<Tensor> &input, c
 }
 
 __global__ void EmbeddingBackwardKernel(const int64_t *input_ptr, const float *grad_output_ptr, float *grad_weight_ptr,
-                                        int num_tokens, int embedding_dim) {
+                                        int num_tokens, int num_embeddings, int embedding_dim) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= num_tokens) {
+    int total_work = num_tokens * embedding_dim;
+    if (idx >= total_work) {
         return;
     }
 
-    int token_id = static_cast<int>(input_ptr[idx]);
-    if (token_id < 0) {
+    int token_pos = idx / embedding_dim;
+    int dim = idx % embedding_dim;
+    int64_t token_id = input_ptr[token_pos];
+    if (token_id < 0 || token_id >= num_embeddings) {
         return;
     }
 
-    for (int j = 0; j < embedding_dim; ++j) {
-        atomicAdd(&grad_weight_ptr[token_id * embedding_dim + j], grad_output_ptr[idx * embedding_dim + j]);
+    for (int prev = 0; prev < token_pos; ++prev) {
+        if (input_ptr[prev] == token_id) {
+            return;
+        }
     }
+
+    float sum = 0.0f;
+    for (int pos = 0; pos < num_tokens; ++pos) {
+        if (input_ptr[pos] == token_id) {
+            sum += grad_output_ptr[pos * embedding_dim + dim];
+        }
+    }
+    grad_weight_ptr[token_id * embedding_dim + dim] = sum;
 }
 
 std::shared_ptr<Tensor> EmbeddingBackward(const std::shared_ptr<Tensor> &input, const std::vector<int64_t> &weight_dims,
@@ -78,12 +87,16 @@ std::shared_ptr<Tensor> EmbeddingBackward(const std::shared_ptr<Tensor> &input, 
     auto grad_weight = std::make_shared<Tensor>(weight_dims, DataType::kFLOAT32, grad_output->GetDevice());
     grad_weight->Fill<float>(0.0f);
     const int num_tokens = input->NumElements();
+    const int num_embeddings = weight_dims[0];
+    const int64_t total_work = static_cast<int64_t>(num_tokens) * embedding_dim;
+    CHECK_LE(total_work, std::numeric_limits<int>::max());
     const int threads_per_block = 256;
-    const int num_blocks = (num_tokens + threads_per_block - 1) / threads_per_block;
+    const int num_blocks = (static_cast<int>(total_work) + threads_per_block - 1) / threads_per_block;
 
     EmbeddingBackwardKernel<<<num_blocks, threads_per_block>>>(
         static_cast<const int64_t *>(input->DataPtr()), static_cast<const float *>(grad_output->DataPtr()),
-        static_cast<float *>(grad_weight->DataPtr()), num_tokens, embedding_dim);
+        static_cast<float *>(grad_weight->DataPtr()), num_tokens, num_embeddings, embedding_dim);
+    CUDA_KERNEL_CHECK();
     return grad_weight;
 }
 } // namespace infini_train::kernels::cuda
