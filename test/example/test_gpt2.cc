@@ -2193,6 +2193,84 @@ protected:
         autograd::BackwardDiagnosticsObserver *previous_ = nullptr;
     };
 
+    class TensorOwnerBackwardObserver final : public autograd::BackwardDiagnosticsObserver {
+    public:
+        TensorOwnerBackwardObserver(int run_id, std::string label, std::vector<const Tensor *> owners)
+            : run_id_(run_id), label_(std::move(label)) {
+            for (const Tensor *owner : owners) {
+                CHECK(owner != nullptr);
+                owner_data_.insert(owner->DataPtr());
+                if (auto grad = owner->grad()) {
+                    grad_data_.insert(grad->DataPtr());
+                    grad_tensors_.push_back(grad.get());
+                }
+            }
+        }
+
+        void OnBackwardStart(const Tensor &root) override {
+            (void)root;
+            for (const Tensor *grad_tensor : grad_tensors_) {
+                Capture("backward_start_" + label_, "grad_buffer", *grad_tensor);
+            }
+        }
+
+        void OnContributionProduced(const std::string &source, const Tensor *owner, const Tensor &contribution) override {
+            if (owner == nullptr || owner_data_.count(owner->DataPtr()) == 0) {
+                return;
+            }
+            Capture(source + "_contribution_produced", source, contribution);
+        }
+
+        void OnAccumulateBefore(const autograd::BackwardContributionInfo &info, const Tensor &grad_buffer,
+                                const Tensor &contribution) override {
+            (void)contribution;
+            if (grad_data_.count(grad_buffer.DataPtr()) == 0) {
+                return;
+            }
+            Capture("accumulate_before_" + info.source, info.source, grad_buffer);
+        }
+
+        void OnAccumulateAfter(const autograd::BackwardContributionInfo &info, const Tensor &grad_buffer,
+                               const Tensor &contribution) override {
+            (void)contribution;
+            if (grad_data_.count(grad_buffer.DataPtr()) == 0) {
+                return;
+            }
+            Capture("accumulate_after_" + info.source, info.source, grad_buffer);
+        }
+
+        void OnBackwardEnd(const Tensor &root) override {
+            (void)root;
+            for (const Tensor *grad_tensor : grad_tensors_) {
+                Capture("backward_end_" + label_, "grad_buffer", *grad_tensor);
+            }
+        }
+
+        const std::vector<BackwardContributionSnapshot> &snapshots() const { return snapshots_; }
+
+    private:
+        void Capture(const std::string &event, const std::string &source, const Tensor &tensor) {
+            auto payload = CopyTensorToLogitsBinary(const_cast<Tensor &>(tensor));
+            const size_t nonzero_count = std::count_if(payload.data.begin(), payload.data.end(),
+                                                       [](float value) { return value != 0.0f; });
+            LOG(INFO) << "BACKWARD_CONTRIB_SNAPSHOT run=" << run_id_
+                      << " observer=" << label_
+                      << " event=" << event
+                      << " source=" << source
+                      << " dims=" << DimsToString(payload.dims)
+                      << " elements=" << payload.data.size()
+                      << " nonzero_count=" << nonzero_count;
+            snapshots_.push_back({.event = event, .source = source, .tensor = std::move(payload)});
+        }
+
+        int run_id_ = 0;
+        std::string label_;
+        std::unordered_set<const void *> owner_data_;
+        std::unordered_set<const void *> grad_data_;
+        std::vector<const Tensor *> grad_tensors_;
+        std::vector<BackwardContributionSnapshot> snapshots_;
+    };
+
     class SharedWeightBackwardObserver final : public autograd::BackwardDiagnosticsObserver {
     public:
         SharedWeightBackwardObserver(int run_id, const Tensor &shared_weight, const Tensor &shared_grad)
@@ -2262,11 +2340,23 @@ protected:
         std::vector<BackwardContributionSnapshot> snapshots_;
     };
 
-    std::shared_ptr<Tensor> SharedLmHeadWeight(PairedTrainingRun &run) {
+    std::shared_ptr<Tensor> GetStateTensor(PairedTrainingRun &run, const std::string &name) {
         auto state_dict = run.model->StateDict();
-        const auto it = state_dict.find("lm_head.weight");
-        CHECK(it != state_dict.end());
+        const auto it = state_dict.find(name);
+        CHECK(it != state_dict.end()) << name;
         return it->second;
+    }
+
+    std::shared_ptr<Tensor> SharedLmHeadWeight(PairedTrainingRun &run) {
+        return GetStateTensor(run, "lm_head.weight");
+    }
+
+    std::shared_ptr<Tensor> LayerNormH0Ln1Weight(PairedTrainingRun &run) {
+        return GetStateTensor(run, "transformer.h.0.ln_1.weight");
+    }
+
+    std::shared_ptr<Tensor> LayerNormH0Ln1Bias(PairedTrainingRun &run) {
+        return GetStateTensor(run, "transformer.h.0.ln_1.bias");
     }
 
     std::vector<BackwardContributionSnapshot> RunBackwardWithSharedWeightObserver(PairedTrainingRun &run,
@@ -2276,6 +2366,19 @@ protected:
         CHECK(shared_grad != nullptr) << "shared lm_head.weight grad must exist after optimizer->ZeroGrad()";
         SharedWeightBackwardObserver observer(run.run_id, *shared_weight, *shared_grad);
         observer.SetSharedGradTensor(*shared_grad);
+        {
+            ScopedBackwardDiagnosticsObserver scoped(&observer);
+            loss.Backward();
+        }
+        return observer.snapshots();
+    }
+
+    std::vector<BackwardContributionSnapshot> RunBackwardWithLayerNormObserver(PairedTrainingRun &run, Tensor &loss) {
+        auto ln_weight = LayerNormH0Ln1Weight(run);
+        auto ln_bias = LayerNormH0Ln1Bias(run);
+        CHECK(ln_weight->grad() != nullptr) << "transformer.h.0.ln_1.weight grad must exist";
+        CHECK(ln_bias->grad() != nullptr) << "transformer.h.0.ln_1.bias grad must exist";
+        TensorOwnerBackwardObserver observer(run.run_id, "layernorm_h0_ln1", {ln_weight.get(), ln_bias.get()});
         {
             ScopedBackwardDiagnosticsObserver scoped(&observer);
             loss.Backward();
@@ -2681,6 +2784,287 @@ protected:
         (void)timed_runs;
         return -1.0;
 #endif
+    }
+
+    struct LayerNormBackwardPayloads {
+        LogitsBinary grad_input;
+        LogitsBinary grad_weight;
+        LogitsBinary grad_bias;
+    };
+
+    LogitsBinary MakeLayerNormGradOutputPayload(const std::vector<int64_t> &dims, const std::string &case_name) {
+        LogitsBinary payload{.dims = dims, .data = std::vector<float>(
+            static_cast<size_t>(dims[0] * dims[1] * dims[2]), 0.0f)};
+        const int64_t tokens = dims[0] * dims[1];
+        const int64_t hidden = dims[2];
+        for (int64_t token = 0; token < tokens; ++token) {
+            for (int64_t feature = 0; feature < hidden; ++feature) {
+                const size_t index = static_cast<size_t>(token * hidden + feature);
+                if (case_name == "similar_values") {
+                    payload.data[index] = 0.125f + static_cast<float>((token + feature) % 7) * 1.0e-7f;
+                } else if (case_name == "mixed_magnitude") {
+                    const float sign = ((token + feature) % 2 == 0) ? 1.0f : -1.0f;
+                    payload.data[index] = (token % 3 == 0) ? sign * 32.0f
+                                                           : sign * static_cast<float>((feature % 5) + 1) * 1.0e-7f;
+                } else {
+                    const int value = static_cast<int>((index * 1664525ULL + 1013904223ULL) % 8192ULL);
+                    payload.data[index] = (static_cast<float>(value) - 4096.0f) * 2.5e-4f;
+                }
+            }
+        }
+        return payload;
+    }
+
+    LayerNormBackwardPayloads ComputeLayerNormBackwardCpuReference(const LogitsBinary &input_payload,
+                                                                   const LogitsBinary &weight_payload,
+                                                                   const LogitsBinary &mean_payload,
+                                                                   const LogitsBinary &rstd_payload,
+                                                                   const LogitsBinary &grad_output_payload) {
+        CHECK_EQ(input_payload.dims.size(), 3);
+        const int64_t batch_size = input_payload.dims[0];
+        const int64_t max_seqlen = input_payload.dims[1];
+        const int64_t embed_dim = input_payload.dims[2];
+        const int64_t tokens = batch_size * max_seqlen;
+        const std::vector<int64_t> expected_weight_dims{embed_dim};
+        const std::vector<int64_t> expected_stat_dims{batch_size, max_seqlen};
+        CHECK(weight_payload.dims == expected_weight_dims)
+            << "weight dims=" << DimsToString(weight_payload.dims)
+            << " expected=" << DimsToString(expected_weight_dims);
+        CHECK(mean_payload.dims == expected_stat_dims)
+            << "mean dims=" << DimsToString(mean_payload.dims)
+            << " expected=" << DimsToString(expected_stat_dims);
+        CHECK(rstd_payload.dims == expected_stat_dims)
+            << "rstd dims=" << DimsToString(rstd_payload.dims)
+            << " expected=" << DimsToString(expected_stat_dims);
+        CHECK(grad_output_payload.dims == input_payload.dims)
+            << "grad_output dims=" << DimsToString(grad_output_payload.dims)
+            << " input dims=" << DimsToString(input_payload.dims);
+        LayerNormBackwardPayloads result{
+            .grad_input = LogitsBinary{.dims = input_payload.dims,
+                                       .data = std::vector<float>(input_payload.data.size(), 0.0f)},
+            .grad_weight = LogitsBinary{.dims = weight_payload.dims,
+                                        .data = std::vector<float>(static_cast<size_t>(embed_dim), 0.0f)},
+            .grad_bias = LogitsBinary{.dims = weight_payload.dims,
+                                      .data = std::vector<float>(static_cast<size_t>(embed_dim), 0.0f)},
+        };
+        for (int64_t token = 0; token < tokens; ++token) {
+            const float mean = mean_payload.data[static_cast<size_t>(token)];
+            const float rstd = rstd_payload.data[static_cast<size_t>(token)];
+            float dnorm_mean = 0.0f;
+            float dnorm_norm_mean = 0.0f;
+            for (int64_t feature = 0; feature < embed_dim; ++feature) {
+                const size_t index = static_cast<size_t>(token * embed_dim + feature);
+                const float norm = (input_payload.data[index] - mean) * rstd;
+                const float dnorm = weight_payload.data[static_cast<size_t>(feature)] * grad_output_payload.data[index];
+                dnorm_mean += dnorm;
+                dnorm_norm_mean += dnorm * norm;
+            }
+            dnorm_mean /= static_cast<float>(embed_dim);
+            dnorm_norm_mean /= static_cast<float>(embed_dim);
+            for (int64_t feature = 0; feature < embed_dim; ++feature) {
+                const size_t index = static_cast<size_t>(token * embed_dim + feature);
+                const float norm = (input_payload.data[index] - mean) * rstd;
+                const float dnorm = weight_payload.data[static_cast<size_t>(feature)] * grad_output_payload.data[index];
+                result.grad_bias.data[static_cast<size_t>(feature)] += grad_output_payload.data[index];
+                result.grad_weight.data[static_cast<size_t>(feature)] += norm * grad_output_payload.data[index];
+                result.grad_input.data[index] = (dnorm - dnorm_mean - norm * dnorm_norm_mean) * rstd;
+            }
+        }
+        return result;
+    }
+
+    std::tuple<LogitsBinary, LogitsBinary> RunLayerNormForwardOnce(const LogitsBinary &input_cpu_payload,
+                                                                    const LogitsBinary &weight_cpu_payload,
+                                                                    const LogitsBinary &bias_cpu_payload, float eps) {
+        auto input_cpu = std::make_shared<Tensor>(input_cpu_payload.dims, DataType::kFLOAT32, Device(DeviceType::kCPU, 0));
+        std::memcpy(input_cpu->DataPtr(), input_cpu_payload.data.data(), input_cpu_payload.data.size() * sizeof(float));
+        auto weight_cpu = std::make_shared<Tensor>(weight_cpu_payload.dims, DataType::kFLOAT32, Device(DeviceType::kCPU, 0));
+        std::memcpy(weight_cpu->DataPtr(), weight_cpu_payload.data.data(), weight_cpu_payload.data.size() * sizeof(float));
+        auto bias_cpu = std::make_shared<Tensor>(bias_cpu_payload.dims, DataType::kFLOAT32, Device(DeviceType::kCPU, 0));
+        std::memcpy(bias_cpu->DataPtr(), bias_cpu_payload.data.data(), bias_cpu_payload.data.size() * sizeof(float));
+        auto input = ToDiagnosticCudaTensor(input_cpu);
+        auto weight = ToDiagnosticCudaTensor(weight_cpu);
+        auto bias = ToDiagnosticCudaTensor(bias_cpu);
+        const auto &layernorm_forward = Dispatcher::Instance().GetKernel({DeviceType::kCUDA, "LayerNormForward"});
+        auto outputs = layernorm_forward.Call<std::tuple<std::shared_ptr<Tensor>, std::shared_ptr<Tensor>,
+                                                         std::shared_ptr<Tensor>>>(input, weight, bias, eps);
+        return {CopyTensorToLogitsBinary(*std::get<1>(outputs)), CopyTensorToLogitsBinary(*std::get<2>(outputs))};
+    }
+
+    LayerNormBackwardPayloads RunLayerNormBackwardOnce(const LogitsBinary &input_cpu_payload,
+                                                       const LogitsBinary &weight_cpu_payload,
+                                                       const LogitsBinary &bias_cpu_payload,
+                                                       const LogitsBinary &mean_cpu_payload,
+                                                       const LogitsBinary &rstd_cpu_payload,
+                                                       const LogitsBinary &grad_output_cpu_payload) {
+        auto make_float_tensor = [](const LogitsBinary &payload) {
+            auto tensor = std::make_shared<Tensor>(payload.dims, DataType::kFLOAT32, Device(DeviceType::kCPU, 0));
+            std::memcpy(tensor->DataPtr(), payload.data.data(), payload.data.size() * sizeof(float));
+            return tensor;
+        };
+        auto input = ToDiagnosticCudaTensor(make_float_tensor(input_cpu_payload));
+        auto weight = ToDiagnosticCudaTensor(make_float_tensor(weight_cpu_payload));
+        auto bias = ToDiagnosticCudaTensor(make_float_tensor(bias_cpu_payload));
+        auto mean = ToDiagnosticCudaTensor(make_float_tensor(mean_cpu_payload));
+        auto rstd = ToDiagnosticCudaTensor(make_float_tensor(rstd_cpu_payload));
+        auto grad_output = ToDiagnosticCudaTensor(make_float_tensor(grad_output_cpu_payload));
+        const auto &layernorm_backward = Dispatcher::Instance().GetKernel({DeviceType::kCUDA, "LayerNormBackward"});
+        auto outputs = layernorm_backward.Call<std::tuple<std::shared_ptr<Tensor>, std::shared_ptr<Tensor>,
+                                                          std::shared_ptr<Tensor>>>(
+            input, weight, bias, mean, rstd, grad_output);
+        return {.grad_input = CopyTensorToLogitsBinary(*std::get<0>(outputs)),
+                .grad_weight = CopyTensorToLogitsBinary(*std::get<1>(outputs)),
+                .grad_bias = CopyTensorToLogitsBinary(*std::get<2>(outputs))};
+    }
+
+    double MeasureLayerNormBackwardAverageMs(const std::vector<int64_t> &input_dims,
+                                             const std::string &case_name, int warmup_runs, int timed_runs) {
+#ifdef USE_CUDA
+        const int64_t hidden = input_dims[2];
+        auto input_cpu = MakeDeterministicFloatTensor(input_dims, 2.5e-3f, 701);
+        auto weight_cpu = MakeDeterministicFloatTensor({hidden}, 1.0e-3f, 702);
+        auto bias_cpu = MakeDeterministicFloatTensor({hidden}, 1.0e-4f, 703);
+        auto input_payload = CopyTensorToLogitsBinary(*input_cpu);
+        auto weight_payload = CopyTensorToLogitsBinary(*weight_cpu);
+        auto bias_payload = CopyTensorToLogitsBinary(*bias_cpu);
+        const auto [mean_payload, rstd_payload] = RunLayerNormForwardOnce(input_payload, weight_payload, bias_payload, 1e-5f);
+        const auto grad_output_payload = MakeLayerNormGradOutputPayload(input_dims, case_name);
+        auto make_float_tensor = [](const LogitsBinary &payload) {
+            auto tensor = std::make_shared<Tensor>(payload.dims, DataType::kFLOAT32, Device(DeviceType::kCPU, 0));
+            std::memcpy(tensor->DataPtr(), payload.data.data(), payload.data.size() * sizeof(float));
+            return tensor;
+        };
+        auto input = ToDiagnosticCudaTensor(make_float_tensor(input_payload));
+        auto weight = ToDiagnosticCudaTensor(make_float_tensor(weight_payload));
+        auto bias = ToDiagnosticCudaTensor(make_float_tensor(bias_payload));
+        auto mean = ToDiagnosticCudaTensor(make_float_tensor(mean_payload));
+        auto rstd = ToDiagnosticCudaTensor(make_float_tensor(rstd_payload));
+        auto grad_output = ToDiagnosticCudaTensor(make_float_tensor(grad_output_payload));
+        const auto &layernorm_backward = Dispatcher::Instance().GetKernel({DeviceType::kCUDA, "LayerNormBackward"});
+        for (int i = 0; i < warmup_runs; ++i) {
+            auto outputs = layernorm_backward.Call<std::tuple<std::shared_ptr<Tensor>, std::shared_ptr<Tensor>,
+                                                              std::shared_ptr<Tensor>>>(
+                input, weight, bias, mean, rstd, grad_output);
+            (void)outputs;
+        }
+        cudaDeviceSynchronize();
+        const auto start = std::chrono::steady_clock::now();
+        for (int i = 0; i < timed_runs; ++i) {
+            auto outputs = layernorm_backward.Call<std::tuple<std::shared_ptr<Tensor>, std::shared_ptr<Tensor>,
+                                                              std::shared_ptr<Tensor>>>(
+                input, weight, bias, mean, rstd, grad_output);
+            (void)outputs;
+        }
+        cudaDeviceSynchronize();
+        const auto end = std::chrono::steady_clock::now();
+        return std::chrono::duration<double, std::milli>(end - start).count() / static_cast<double>(timed_runs);
+#else
+        (void)input_dims;
+        (void)case_name;
+        (void)warmup_runs;
+        (void)timed_runs;
+        return -1.0;
+#endif
+    }
+
+    void LogLayerNormFeatureSummary(const std::string &label, const LogitsBinary &lhs, const LogitsBinary &rhs,
+                                    int64_t reduction_length) {
+        CHECK(lhs.dims == rhs.dims);
+        if (lhs.dims.size() != 1) {
+            return;
+        }
+        const auto metrics = CompareLogitsPayloads(lhs, rhs, 0.0f);
+        size_t max_feature = 0;
+        double max_abs = 0.0;
+        for (size_t feature = 0; feature < lhs.data.size(); ++feature) {
+            const double diff = std::abs(static_cast<double>(lhs.data[feature]) - static_cast<double>(rhs.data[feature]));
+            if (diff > max_abs) {
+                max_abs = diff;
+                max_feature = feature;
+            }
+        }
+        LOG(INFO) << "LAYERNORM_FEATURE_COMPARE label=" << label
+                  << " max_feature=" << max_feature
+                  << " max_abs=" << max_abs
+                  << " first_mismatch=" << OptionalIndexString(metrics.has_bitwise_mismatch, metrics.first_mismatch)
+                  << " mismatch_count=" << metrics.count_bitwise_mismatch
+                  << " reduction_positions_per_feature=" << reduction_length;
+    }
+
+    void LogLayerNormCaseDiagnostics(const std::string &label, const std::vector<int64_t> &input_dims,
+                                     const std::string &grad_output_case, int runs) {
+        CHECK_EQ(input_dims.size(), 3);
+        const int64_t hidden = input_dims[2];
+        const int64_t reduction_length = input_dims[0] * input_dims[1];
+        auto input_cpu = MakeDeterministicFloatTensor(input_dims, 2.5e-3f, 801);
+        auto weight_cpu = MakeDeterministicFloatTensor({hidden}, 1.0e-3f, 802);
+        auto bias_cpu = MakeDeterministicFloatTensor({hidden}, 1.0e-4f, 803);
+        auto input_payload = CopyTensorToLogitsBinary(*input_cpu);
+        auto weight_payload = CopyTensorToLogitsBinary(*weight_cpu);
+        auto bias_payload = CopyTensorToLogitsBinary(*bias_cpu);
+        const auto [mean_payload, rstd_payload] = RunLayerNormForwardOnce(input_payload, weight_payload, bias_payload, 1e-5f);
+        const auto grad_output_payload = MakeLayerNormGradOutputPayload(input_dims, grad_output_case);
+        const auto cpu_reference = ComputeLayerNormBackwardCpuReference(input_payload, weight_payload, mean_payload,
+                                                                        rstd_payload, grad_output_payload);
+        const double average_ms = MeasureLayerNormBackwardAverageMs(input_dims, grad_output_case, 5, 50);
+        LOG(INFO) << "LAYERNORM_BACKWARD_PERF label=" << label
+                  << " average_ms=" << average_ms
+                  << " warmup_runs=5 timed_runs=50"
+                  << " shape=" << DimsToString(input_dims)
+                  << " reduction_length=" << reduction_length
+                  << " hidden=" << hidden
+                  << " grad_output_case=" << grad_output_case;
+
+        CHECK_GE(runs, 2);
+        const auto first_cuda = RunLayerNormBackwardOnce(input_payload, weight_payload, bias_payload, mean_payload,
+                                                         rstd_payload, grad_output_payload);
+        auto compare_cpu = [&](const std::string &output_name, const LogitsBinary &cpu, const LogitsBinary &cuda) {
+            const auto metrics = CompareLogitsPayloads(cpu, cuda, kDiagnosticTolerance);
+            EXPECT_FALSE(TensorHasNonFiniteDiffInput(metrics)) << label << " cuda_vs_cpu " << output_name;
+            LogTensorDiffComparison(label + "." + output_name + ".cuda_vs_cpu.iter0", metrics, kDiagnosticTolerance);
+            LogLayerNormFeatureSummary(label + "." + output_name + ".cuda_vs_cpu.iter0", cpu, cuda, reduction_length);
+        };
+        compare_cpu("grad_input", cpu_reference.grad_input, first_cuda.grad_input);
+        compare_cpu("grad_weight", cpu_reference.grad_weight, first_cuda.grad_weight);
+        compare_cpu("grad_bias", cpu_reference.grad_bias, first_cuda.grad_bias);
+
+        RepeatedTensorRunSummary input_summary;
+        RepeatedTensorRunSummary weight_summary;
+        RepeatedTensorRunSummary bias_summary;
+        auto observe = [&](RepeatedTensorRunSummary &summary, const std::string &output_name, const LogitsBinary &reference,
+                           const LogitsBinary &current, int iter) {
+            const auto metrics = CompareLogitsPayloads(reference, current, 0.0f);
+            EXPECT_FALSE(TensorHasNonFiniteDiffInput(metrics)) << label << " " << output_name << " iteration " << iter;
+            if (metrics.count_bitwise_mismatch != 0 && summary.first_diff_iter < 0) {
+                summary.first_diff_iter = iter;
+            }
+            summary.max_abs = std::max(summary.max_abs, metrics.max_abs);
+            summary.max_bitwise_mismatch_count = std::max(summary.max_bitwise_mismatch_count,
+                                                          metrics.count_bitwise_mismatch);
+            const std::string iter_label = label + "." + output_name + ".cuda_vs_cuda.iter" + std::to_string(iter);
+            LogTensorDiffComparison(iter_label, metrics, 0.0f);
+            LogLayerNormFeatureSummary(iter_label, reference, current, reduction_length);
+        };
+        for (int i = 1; i < runs; ++i) {
+            const auto current_cuda = RunLayerNormBackwardOnce(input_payload, weight_payload, bias_payload, mean_payload,
+                                                               rstd_payload, grad_output_payload);
+            observe(input_summary, "grad_input", first_cuda.grad_input, current_cuda.grad_input, i);
+            observe(weight_summary, "grad_weight", first_cuda.grad_weight, current_cuda.grad_weight, i);
+            observe(bias_summary, "grad_bias", first_cuda.grad_bias, current_cuda.grad_bias, i);
+        }
+        auto log_summary = [&](const char *output_name, const RepeatedTensorRunSummary &summary) {
+            LOG(INFO) << "LAYERNORM_DETERMINISM_RESULT label=" << label
+                      << " output=" << output_name
+                      << " runs=" << runs
+                      << " bitwise_stable=" << (summary.first_diff_iter < 0)
+                      << " first_diff_iter=" << summary.first_diff_iter
+                      << " max_abs=" << summary.max_abs
+                      << " max_bitwise_mismatch_count=" << summary.max_bitwise_mismatch_count
+                      << " reduction_positions_per_feature=" << reduction_length;
+        };
+        log_summary("grad_input", input_summary);
+        log_summary("grad_weight", weight_summary);
+        log_summary("grad_bias", bias_summary);
     }
 
     RepeatedTensorRunSummary LogEmbeddingCaseDiagnostics(const std::string &label,
@@ -3160,6 +3544,29 @@ TEST_F(GPT2TrainingTest, LinearWeightGradientDeterminism) {
     });
 }
 
+TEST_F(GPT2TrainingTest, LayerNormBackwardDeterminism) {
+    ReleaseFixtureTrainingStateForStandaloneKernelTest();
+    constexpr int kRuns = 20;
+    const std::vector<std::pair<std::string, std::vector<int64_t>>> shapes = {
+        {"gpt2_actual", {2, 64, 768}},
+        {"small", {1, 8, 64}},
+        {"large_reduction", {4, 256, 768}},
+    };
+    const std::vector<std::string> cases = {"random", "similar_values", "mixed_magnitude"};
+    for (const auto &[shape_label, dims] : shapes) {
+        for (const auto &case_name : cases) {
+            const std::string label = "LayerNormBackwardDeterminism." + shape_label + "." + case_name;
+            LOG(INFO) << "LAYERNORM_BACKWARD_DETERMINISM_BEGIN label=" << label
+                      << " runs=" << kRuns
+                      << " shape=" << DimsToString(dims)
+                      << " reduction_positions_per_feature=" << (dims[0] * dims[1])
+                      << " hidden=" << dims[2]
+                      << " grad_output_case=" << case_name;
+            LogLayerNormCaseDiagnostics(label, dims, case_name, kRuns);
+        }
+    }
+}
+
 TEST_F(GPT2TrainingTest, EmbeddingWeightGradientDeterminism) {
     ASSERT_TRUE(device.IsCUDA()) << "Embedding weight-gradient determinism diagnostic requires CUDA";
     ReleaseFixtureTrainingStateForStandaloneKernelTest();
@@ -3302,11 +3709,11 @@ TEST_F(GPT2TrainingTest, TiedTrainingFirstDivergenceDiagnostics) {
                                                          first_divergence);
         observe_worst_logits(forward_stage, forward_metrics.logits);
 
-        auto lhs_backward_snapshots = RunBackwardWithSharedWeightObserver(lhs, *forward_lhs.loss);
-        auto rhs_backward_snapshots = RunBackwardWithSharedWeightObserver(rhs, *forward_rhs.loss);
+        auto lhs_layernorm_snapshots = RunBackwardWithLayerNormObserver(lhs, *forward_lhs.loss);
+        auto rhs_layernorm_snapshots = RunBackwardWithLayerNormObserver(rhs, *forward_rhs.loss);
         const std::string backward_stage = "update0_micro" + std::to_string(micro_step) + "_backward";
-        CompareBackwardContributionSnapshots(backward_stage + "_shared_weight_contributions", lhs_backward_snapshots,
-                                             rhs_backward_snapshots, first_divergence, 0, micro_step);
+        CompareBackwardContributionSnapshots(backward_stage + "_layernorm_h0_ln1_contributions", lhs_layernorm_snapshots,
+                                             rhs_layernorm_snapshots, first_divergence, 0, micro_step);
         (void)CompareAndLogAllParameters(backward_stage, 0, micro_step, *lhs.model, *rhs.model, first_divergence);
     }
 

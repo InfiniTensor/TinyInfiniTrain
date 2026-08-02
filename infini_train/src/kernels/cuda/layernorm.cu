@@ -1,6 +1,7 @@
 #include "glog/logging.h"
 #include <cub/block/block_reduce.cuh>
 
+#include "infini_train/include/cuda_check.h"
 #include "infini_train/include/dispatcher.h"
 #include "infini_train/include/tensor.h"
 
@@ -85,10 +86,10 @@ LayerNormForward(const std::shared_ptr<Tensor> &input, const std::shared_ptr<Ten
 }
 
 template <int BLOCK_SIZE>
-__global__ void LayerNormBackwardKernel(const float *__restrict__ input, const float *__restrict__ grad_output,
-                                        const float *__restrict__ mean, const float *__restrict__ rstd,
-                                        const float *__restrict__ weight, float *__restrict__ grad_input,
-                                        float *__restrict__ grad_weight, float *__restrict__ grad_bias, int embed_dim) {
+__global__ void LayerNormBackwardInputKernel(const float *__restrict__ input, const float *__restrict__ grad_output,
+                                             const float *__restrict__ mean, const float *__restrict__ rstd,
+                                             const float *__restrict__ weight, float *__restrict__ grad_input,
+                                             int embed_dim) {
     using BlockReduce = cub::BlockReduce<float, BLOCK_SIZE>;
     __shared__ typename BlockReduce::TempStorage temp_storage_mean;
     __shared__ typename BlockReduce::TempStorage temp_storage_norm;
@@ -129,11 +130,40 @@ __global__ void LayerNormBackwardKernel(const float *__restrict__ input, const f
 
     for (int i = tid; i < embed_dim; i += BLOCK_SIZE) {
         float norm = (input_ptr[i] - mean_val) * rstd_val;
-
         grad_input_ptr[i] = (weight[i] * grad_output_ptr[i] - shared_mean - norm * shared_norm) * rstd_val;
+    }
+}
 
-        atomicAdd(&grad_weight[i], grad_output_ptr[i] * norm);
-        atomicAdd(&grad_bias[i], grad_output_ptr[i]);
+template <int BLOCK_SIZE>
+__global__ void LayerNormBackwardParamKernel(const float *__restrict__ input, const float *__restrict__ grad_output,
+                                             const float *__restrict__ mean, const float *__restrict__ rstd,
+                                             float *__restrict__ grad_weight, float *__restrict__ grad_bias,
+                                             int num_tokens, int embed_dim) {
+    using BlockReduce = cub::BlockReduce<float, BLOCK_SIZE>;
+    __shared__ typename BlockReduce::TempStorage temp_storage_weight;
+    __shared__ typename BlockReduce::TempStorage temp_storage_bias;
+
+    const int feature = blockIdx.x;
+    if (feature >= embed_dim) {
+        return;
+    }
+
+    float weight_sum = 0.0f;
+    float bias_sum = 0.0f;
+    for (int token_idx = threadIdx.x; token_idx < num_tokens; token_idx += BLOCK_SIZE) {
+        const int offset = token_idx * embed_dim + feature;
+        const float norm = (input[offset] - mean[token_idx]) * rstd[token_idx];
+        const float grad = grad_output[offset];
+        weight_sum += grad * norm;
+        bias_sum += grad;
+    }
+
+    const float total_weight = BlockReduce(temp_storage_weight).Sum(weight_sum);
+    __syncthreads();
+    const float total_bias = BlockReduce(temp_storage_bias).Sum(bias_sum);
+    if (threadIdx.x == 0) {
+        grad_weight[feature] = total_weight;
+        grad_bias[feature] = total_bias;
     }
 }
 
@@ -156,11 +186,17 @@ LayerNormBackward(const std::shared_ptr<Tensor> &input, const std::shared_ptr<Te
     int threads_per_block = BLOCK_SIZE;
     int num_blocks = batch_size * max_seqlen;
 
-    LayerNormBackwardKernel<BLOCK_SIZE><<<num_blocks, threads_per_block>>>(
+    LayerNormBackwardInputKernel<BLOCK_SIZE><<<num_blocks, threads_per_block>>>(
         static_cast<const float *>(input->DataPtr()), static_cast<const float *>(grad_output->DataPtr()),
         static_cast<const float *>(mean->DataPtr()), static_cast<const float *>(rstd->DataPtr()),
-        static_cast<const float *>(weight->DataPtr()), static_cast<float *>(grad_input->DataPtr()),
-        static_cast<float *>(grad_weight->DataPtr()), static_cast<float *>(grad_bias->DataPtr()), embed_dim);
+        static_cast<const float *>(weight->DataPtr()), static_cast<float *>(grad_input->DataPtr()), embed_dim);
+    CUDA_KERNEL_CHECK();
+    LayerNormBackwardParamKernel<BLOCK_SIZE><<<embed_dim, threads_per_block>>>(
+        static_cast<const float *>(input->DataPtr()), static_cast<const float *>(grad_output->DataPtr()),
+        static_cast<const float *>(mean->DataPtr()), static_cast<const float *>(rstd->DataPtr()),
+        static_cast<float *>(grad_weight->DataPtr()), static_cast<float *>(grad_bias->DataPtr()),
+        batch_size * max_seqlen, embed_dim);
+    CUDA_KERNEL_CHECK();
     return {grad_input, grad_weight, grad_bias};
 }
 } // namespace infini_train::kernels::cuda

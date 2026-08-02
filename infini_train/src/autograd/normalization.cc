@@ -45,6 +45,14 @@ std::vector<std::shared_ptr<Tensor>> LayerNorm::Backward(const std::vector<std::
     auto [grad_input, grad_weight, grad_bias]
         = kernel.Call<std::tuple<std::shared_ptr<Tensor>, std::shared_ptr<Tensor>, std::shared_ptr<Tensor>>>(
             input, weight, bias, mean, rstd, grad_output);
+    if (auto *observer = GetBackwardDiagnosticsObserver()) {
+        RegisterBackwardContributionSource(grad_input.get(), "layernorm_input", input.get());
+        RegisterBackwardContributionSource(grad_weight.get(), "layernorm_weight", weight.get());
+        RegisterBackwardContributionSource(grad_bias.get(), "layernorm_bias", bias.get());
+        observer->OnContributionProduced("layernorm_input", input.get(), *grad_input);
+        observer->OnContributionProduced("layernorm_weight", weight.get(), *grad_weight);
+        observer->OnContributionProduced("layernorm_bias", bias.get(), *grad_bias);
+    }
     return {grad_input, grad_weight, grad_bias};
 }
 } // namespace infini_train::autograd
