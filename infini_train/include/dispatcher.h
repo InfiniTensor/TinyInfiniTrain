@@ -22,6 +22,7 @@ public:
 
         using FuncT = RetT (*)(ArgsT...);
         // TODO: 实现函数调用逻辑
+        return reinterpret_cast<FuncT>(func_ptr_)(args...);
     }
 
 private:
@@ -48,6 +49,9 @@ public:
         // TODO：实现kernel注册机制
         // 功能描述：将kernel函数与设备类型、名称绑定
         // =================================== 作业 ===================================
+        CHECK(!key_to_kernel_map_.contains(key))
+            << "Kernel already registered: " << key.second << " on device: " << static_cast<int>(key.first);  // Fix CR#L52
+        key_to_kernel_map_.emplace(key, KernelFunction(std::forward<FuncT>(kernel)));
     }
 
 private:
@@ -55,8 +59,14 @@ private:
 };
 } // namespace infini_train
 
+#define INFINI_KERNEL_CONCAT_(a, b) a##b
+#define INFINI_KERNEL_CONCAT(a, b) INFINI_KERNEL_CONCAT_(a, b)
 #define REGISTER_KERNEL(device, kernel_name, kernel_func)                                                              \
-    // =================================== 作业 ===================================
-    // TODO：实现自动注册宏
-    // 功能描述：在全局静态区注册kernel，避免显式初始化代码
-    // =================================== 作业 ===================================
+    /* =================================== 作业 =================================== */                               \
+    /* TODO：实现自动注册宏 */                                                                                 \
+    /* 功能描述：在全局静态区注册kernel，避免显式初始化代码 */                                  \
+    /* =================================== 作业 =================================== */                               \
+    static const bool INFINI_KERNEL_CONCAT(kernel_reg_, __COUNTER__) =                                                 \
+        (infini_train::Dispatcher::Instance().Register(                                                                \
+             std::make_pair(device, #kernel_name), kernel_func),                                                       \
+         true);
