@@ -21,6 +21,7 @@ std::shared_ptr<Tensor> MatmulForward(const std::shared_ptr<Tensor> &input, cons
     CHECK_EQ(input_dims.size(), other_dims.size());
 
     // input[batch..., rows, in_features] × other[batch..., in_features, out_features] -> output[batch..., rows, out_features]
+    // 逐 batch 严格相等（batch 维不支持 torch.matmul 的广播语义）  // Fix CR#L30-L33
     const int64_t batch_ndim = input_dims.size() - 2;
     const int64_t batch =
         std::accumulate(input_dims.begin(), input_dims.begin() + batch_ndim, 1, std::multiplies<int64_t>{});
@@ -39,15 +40,19 @@ std::shared_ptr<Tensor> MatmulForward(const std::shared_ptr<Tensor> &input, cons
     const float *input_data = static_cast<const float *>(input->DataPtr());
     const float *other_data = static_cast<const float *>(other->DataPtr());
     float *output_data = static_cast<float *>(output->DataPtr());
+    // 循环次序 r->k->c（内层 c）：other 与 output 沿连续方向访问（缓存友好），output 先清零再累积  // Fix CR#L42-L53
+    const int64_t output_size = batch * rows * out_features;
+    for (int64_t idx = 0; idx < output_size; ++idx) {
+        output_data[idx] = 0.0f;
+    }
     for (int64_t b = 0; b < batch; ++b) {
         for (int64_t r = 0; r < rows; ++r) {
-            for (int64_t c = 0; c < out_features; ++c) {
-                float sum = 0.0f;
-                for (int64_t k = 0; k < in_features; ++k) {
-                    sum += input_data[(b * rows + r) * in_features + k]
-                           * other_data[(b * in_features + k) * out_features + c];
+            for (int64_t k = 0; k < in_features; ++k) {
+                const float a = input_data[(b * rows + r) * in_features + k];
+                for (int64_t c = 0; c < out_features; ++c) {
+                    output_data[(b * rows + r) * out_features + c]
+                        += a * other_data[(b * in_features + k) * out_features + c];
                 }
-                output_data[(b * rows + r) * out_features + c] = sum;
             }
         }
     }
@@ -68,6 +73,7 @@ MatmulBackward(const std::shared_ptr<Tensor> &input, const std::shared_ptr<Tenso
     CHECK_EQ(input_dims.size(), other_dims.size());
 
     // grad_input = grad_output × other^T，grad_other = input^T × grad_output
+    // 逐 batch 严格相等（batch 维不支持 torch.matmul 的广播语义）  // Fix CR#L77-L80
     const int64_t batch_ndim = input_dims.size() - 2;
     const int64_t batch =
         std::accumulate(input_dims.begin(), input_dims.begin() + batch_ndim, 1, std::multiplies<int64_t>{});
@@ -91,7 +97,14 @@ MatmulBackward(const std::shared_ptr<Tensor> &input, const std::shared_ptr<Tenso
     const float *grad_output_data = static_cast<const float *>(grad_output->DataPtr());
     float *grad_input_data = static_cast<float *>(grad_input->DataPtr());
     float *grad_other_data = static_cast<float *>(grad_other->DataPtr());
+    // grad_other[b][k][c] = Σ_r input[b][r][k] * grad_output[b][r][c]
+    // 循环次序 k->r->c（内层 c）：grad_output 与 grad_other 沿连续方向访问（缓存友好），grad_other 先清零  // Fix CR#L94-L115
+    const int64_t grad_other_size = batch * in_features * out_features;
+    for (int64_t idx = 0; idx < grad_other_size; ++idx) {
+        grad_other_data[idx] = 0.0f;
+    }
     for (int64_t b = 0; b < batch; ++b) {
+        // grad_input[b][r][k] = Σ_c grad_output[b][r][c] * other[b][k][c]（c 最内层，两操作数连续访问）
         for (int64_t r = 0; r < rows; ++r) {
             for (int64_t k = 0; k < in_features; ++k) {
                 float sum = 0.0f;
@@ -103,13 +116,12 @@ MatmulBackward(const std::shared_ptr<Tensor> &input, const std::shared_ptr<Tenso
             }
         }
         for (int64_t k = 0; k < in_features; ++k) {
-            for (int64_t c = 0; c < out_features; ++c) {
-                float sum = 0.0f;
-                for (int64_t r = 0; r < rows; ++r) {
-                    sum += input_data[(b * rows + r) * in_features + k]
-                           * grad_output_data[(b * rows + r) * out_features + c];
+            for (int64_t r = 0; r < rows; ++r) {
+                const float a = input_data[(b * rows + r) * in_features + k];
+                for (int64_t c = 0; c < out_features; ++c) {
+                    grad_other_data[(b * in_features + k) * out_features + c]
+                        += a * grad_output_data[(b * rows + r) * out_features + c];
                 }
-                grad_other_data[(b * in_features + k) * out_features + c] = sum;
             }
         }
     }
