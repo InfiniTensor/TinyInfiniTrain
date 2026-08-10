@@ -282,6 +282,10 @@ std::shared_ptr<Tensor> Tensor::Flatten(int64_t start, int64_t end) {
     // TODO：实现张量扁平化操作，将指定维度范围[start, end]内的所有维度合并为一个维度
     // HINT:
     // =================================== 作业 ===================================
+    if (dims_.empty()) {
+        // Fix CR#L285-L294：零维张量（标量）无维度可合并，返回原张量，对齐 PyTorch 0 维 flatten 语义
+        return shared_from_this();
+    }
     if (start < 0) {
         start += dims_.size();
     }
@@ -379,13 +383,22 @@ void Tensor::Backward(std::shared_ptr<Tensor> gradient, bool retain_graph, bool 
     // 功能描述：1. 计算当前张量对叶子节点的梯度    2. 支持多输出场景的梯度累加
     // =================================== 作业 ===================================
     if (!gradient) {
-        // 无参调用（对应 PyTorch 标量输出 tensor.backward() 语义）：默认梯度为全 1
+        // 无参调用（对应 PyTorch 标量输出 tensor.backward() 语义）：默认梯度为全 1  // Fix CR#L381-L385
+        // 注：非标量输出同样构造全 1 梯度（数学上等价于显式 ones 梯度），与 PyTorch 的标量检查不同，
+        // 属教学框架的宽容语义；默认梯度经 Fill kernel 按 float 填充，当前仅支持框架使用的 float32 路径。
         gradient = std::make_shared<Tensor>(dims_, dtype_, GetDevice());
         gradient->Fill<float>(1.0f);
+    } else {
+        // Fix CR#L386-L388：透传前校验梯度形状与设备一致，防止元素错位静默累加与越界写
+        CHECK(gradient->Dims() == dims_) << "Backward gradient shape mismatch";
+        CHECK_EQ(static_cast<int>(gradient->GetDevice().Type()), static_cast<int>(GetDevice().Type()))
+            << "Backward gradient device mismatch";
     }
     if (grad_fn_) {
         grad_fn_->BackwardPartial(gradient, output_idx_);
     }
+    // 契约（与 PyTorch 语义差异说明）：同一图仅可传播一次，重复传播为未定义行为（根因在官方引擎传播后
+    // 不重置依赖计数，修改受限）；retain_graph/create_graph 参数当前无效果；无梯度函数（叶子）调用为空操作。
 }
 
 void Tensor::ZeroGrad() {
