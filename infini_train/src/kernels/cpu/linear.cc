@@ -15,9 +15,43 @@ std::shared_ptr<Tensor> MatmulForward(const std::shared_ptr<Tensor> &input, cons
     // TODO：实现CPU上的矩阵乘法前向计算
     // REF:
     // =================================== 作业 ===================================
+    const auto &input_dims = input->Dims();
+    const auto &other_dims = other->Dims();
+    CHECK_GE(input_dims.size(), 2);
+    CHECK_EQ(input_dims.size(), other_dims.size());
 
-    auto output = std::make_shared<Tensor>();
-    return {output};
+    // input[batch..., rows, in_features] × other[batch..., in_features, out_features] -> output[batch..., rows, out_features]
+    const int64_t batch_ndim = input_dims.size() - 2;
+    const int64_t batch =
+        std::accumulate(input_dims.begin(), input_dims.begin() + batch_ndim, 1, std::multiplies<int64_t>{});
+    const int64_t rows = input_dims[batch_ndim];
+    const int64_t in_features = *input_dims.rbegin();
+    const int64_t out_features = *other_dims.rbegin();
+    for (int64_t dim = 0; dim < batch_ndim; ++dim) {
+        CHECK_EQ(input_dims[dim], other_dims[dim]);
+    }
+    CHECK_EQ(in_features, *(other_dims.rbegin() + 1));
+
+    auto output_dims = input_dims;
+    *output_dims.rbegin() = out_features;
+    auto output = std::make_shared<Tensor>(output_dims, DataType::kFLOAT32);
+
+    const float *input_data = static_cast<const float *>(input->DataPtr());
+    const float *other_data = static_cast<const float *>(other->DataPtr());
+    float *output_data = static_cast<float *>(output->DataPtr());
+    for (int64_t b = 0; b < batch; ++b) {
+        for (int64_t r = 0; r < rows; ++r) {
+            for (int64_t c = 0; c < out_features; ++c) {
+                float sum = 0.0f;
+                for (int64_t k = 0; k < in_features; ++k) {
+                    sum += input_data[(b * rows + r) * in_features + k]
+                           * other_data[(b * in_features + k) * out_features + c];
+                }
+                output_data[(b * rows + r) * out_features + c] = sum;
+            }
+        }
+    }
+    return output;
 }
 
 std::tuple<std::shared_ptr<Tensor>, std::shared_ptr<Tensor>>
@@ -27,9 +61,58 @@ MatmulBackward(const std::shared_ptr<Tensor> &input, const std::shared_ptr<Tenso
     // TODO：实现CPU上的矩阵乘法反向传播
     // REF:
     // =================================== 作业 ===================================
+    const auto &input_dims = input->Dims();
+    const auto &other_dims = other->Dims();
+    const auto &grad_output_dims = grad_output->Dims();
+    CHECK_GE(input_dims.size(), 2);
+    CHECK_EQ(input_dims.size(), other_dims.size());
 
-    auto grad_input = std::make_shared<Tensor>();
-    auto grad_other = std::make_shared<Tensor>();
+    // grad_input = grad_output × other^T，grad_other = input^T × grad_output
+    const int64_t batch_ndim = input_dims.size() - 2;
+    const int64_t batch =
+        std::accumulate(input_dims.begin(), input_dims.begin() + batch_ndim, 1, std::multiplies<int64_t>{});
+    const int64_t rows = input_dims[batch_ndim];
+    const int64_t in_features = *input_dims.rbegin();
+    const int64_t out_features = *other_dims.rbegin();
+    for (int64_t dim = 0; dim < batch_ndim; ++dim) {
+        CHECK_EQ(input_dims[dim], other_dims[dim]);
+    }
+    CHECK_EQ(in_features, *(other_dims.rbegin() + 1));
+
+    auto output_dims = input_dims;
+    *output_dims.rbegin() = out_features;
+    CHECK(grad_output_dims == output_dims);
+
+    auto grad_input = std::make_shared<Tensor>(input_dims, DataType::kFLOAT32);
+    auto grad_other = std::make_shared<Tensor>(other_dims, DataType::kFLOAT32);
+
+    const float *input_data = static_cast<const float *>(input->DataPtr());
+    const float *other_data = static_cast<const float *>(other->DataPtr());
+    const float *grad_output_data = static_cast<const float *>(grad_output->DataPtr());
+    float *grad_input_data = static_cast<float *>(grad_input->DataPtr());
+    float *grad_other_data = static_cast<float *>(grad_other->DataPtr());
+    for (int64_t b = 0; b < batch; ++b) {
+        for (int64_t r = 0; r < rows; ++r) {
+            for (int64_t k = 0; k < in_features; ++k) {
+                float sum = 0.0f;
+                for (int64_t c = 0; c < out_features; ++c) {
+                    sum += grad_output_data[(b * rows + r) * out_features + c]
+                           * other_data[(b * in_features + k) * out_features + c];
+                }
+                grad_input_data[(b * rows + r) * in_features + k] = sum;
+            }
+        }
+        for (int64_t k = 0; k < in_features; ++k) {
+            for (int64_t c = 0; c < out_features; ++c) {
+                float sum = 0.0f;
+                for (int64_t r = 0; r < rows; ++r) {
+                    sum += input_data[(b * rows + r) * in_features + k]
+                           * grad_output_data[(b * rows + r) * out_features + c];
+                }
+                grad_other_data[(b * in_features + k) * out_features + c] = sum;
+            }
+        }
+    }
     return {grad_input, grad_other};
 }
 
