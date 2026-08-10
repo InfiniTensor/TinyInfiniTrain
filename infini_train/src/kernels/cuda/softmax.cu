@@ -1,3 +1,8 @@
+// 注意：libcu++ 头（cuda/std/*）必须在任何标准库头之前包含（CUDA 13 自带 CUB 3.x 触发此分支）。
+#if defined(CUB_VERSION) && CUB_VERSION >= 200800
+#include <cuda/std/functional>
+#endif
+
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -12,7 +17,6 @@
 namespace infini_train::kernels::cuda {
 
 #if defined(CUB_VERSION) && CUB_VERSION >= 200800
-    #include <cuda/std/functional>
     using CubSumOp = ::cuda::std::plus<>;
     using CubMaxOp = ::cuda::maximum<>;
     using CubMinOp = ::cuda::minimum<>;
