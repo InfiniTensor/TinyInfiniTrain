@@ -282,8 +282,28 @@ std::shared_ptr<Tensor> Tensor::Flatten(int64_t start, int64_t end) {
     // TODO：实现张量扁平化操作，将指定维度范围[start, end]内的所有维度合并为一个维度
     // HINT:
     // =================================== 作业 ===================================
+    if (start < 0) {
+        start += dims_.size();
+    }
+    if (end < 0) {
+        end += dims_.size();
+    }
+    CHECK_GE(start, 0);
+    CHECK_LT(start, dims_.size());
+    CHECK_GE(end, start);
+    CHECK_LT(end, dims_.size());
 
-    return std::make_shared<Tensor>();
+    int64_t flattened_dim = 1;
+    for (int64_t dim = start; dim <= end; ++dim) {
+        flattened_dim *= dims_[dim];
+    }
+
+    std::vector<int64_t> new_shape;
+    new_shape.insert(new_shape.end(), dims_.begin(), dims_.begin() + start);
+    new_shape.push_back(flattened_dim);
+    new_shape.insert(new_shape.end(), dims_.begin() + end + 1, dims_.end());
+
+    return Contiguous()->View(new_shape);
 }
 
 std::shared_ptr<Tensor> Tensor::Squeeze(int64_t dim) {
@@ -358,6 +378,14 @@ void Tensor::Backward(std::shared_ptr<Tensor> gradient, bool retain_graph, bool 
     // TODO：实现自动微分反向传播
     // 功能描述：1. 计算当前张量对叶子节点的梯度    2. 支持多输出场景的梯度累加
     // =================================== 作业 ===================================
+    if (!gradient) {
+        // 无参调用（对应 PyTorch 标量输出 tensor.backward() 语义）：默认梯度为全 1
+        gradient = std::make_shared<Tensor>(dims_, dtype_, GetDevice());
+        gradient->Fill<float>(1.0f);
+    }
+    if (grad_fn_) {
+        grad_fn_->BackwardPartial(gradient, output_idx_);
+    }
 }
 
 void Tensor::ZeroGrad() {
