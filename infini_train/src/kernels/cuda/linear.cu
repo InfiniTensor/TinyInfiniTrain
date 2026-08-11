@@ -23,7 +23,7 @@ namespace infini_train::kernels::cuda {
         }                                                                                                              \
     } while (0)
 
-// restrict 承诺：写目标（output）必须与读源（input/other）不重叠，原地调用属未定义行为  // Fix CR#L26-L28
+// restrict 承诺：写目标（output）必须与读源（input/other）不重叠，原地调用属未定义行为
 __global__ void MatmulForwardKernel(const float *__restrict__ input, const float *__restrict__ other,
                                     float *__restrict__ output, int rows, int in_features, int out_features,
                                     int total) {
@@ -37,7 +37,7 @@ __global__ void MatmulForwardKernel(const float *__restrict__ input, const float
     int batch = tmp / rows;
 
     // 每个线程串行累加 k（k 升序，固定累加顺序保证 GPU 侧运行位级确定；
-    // 与 CPU 版在容差内一致——nvcc 默认 FMA 融合（--fmad=true），存在 1 ULP 级差异）  // Fix CR#L38
+    // 与 CPU 版在容差内一致——nvcc 默认 FMA 融合（--fmad=true），存在 1 ULP 级差异）
     float sum = 0.0f;
     const float *input_row = input + (batch * rows + row) * in_features;
     const float *other_base = other + (batch * in_features) * out_features + col;
@@ -69,7 +69,7 @@ std::shared_ptr<Tensor> MatmulForward(const std::shared_ptr<Tensor> &input, cons
         CHECK_EQ(input_dims[dim], other_dims[dim]);
     }
     CHECK_EQ(in_features, *(other_dims.rbegin() + 1));
-    CHECK_EQ(static_cast<int>(input->GetDevice().Type()), static_cast<int>(other->GetDevice().Type()));  // Fix CR#L160-L161
+    CHECK_EQ(static_cast<int>(input->GetDevice().Type()), static_cast<int>(other->GetDevice().Type()));
 
     auto output_dims = input_dims;
     *output_dims.rbegin() = out_features;
@@ -77,7 +77,7 @@ std::shared_ptr<Tensor> MatmulForward(const std::shared_ptr<Tensor> &input, cons
 
     // 一元素一线程 + 边界检查（网格按 CEIL_DIV 划分，与官方 kernel 风格一致）
     const int64_t total = batch * rows * out_features;
-    // Fix CR#L76-L82：32 位索引范围防护（total 超出 int 范围时快速失败，避免溢出为负导致静默空输出）
+    // 32 位索引范围防护（total 超出 int 范围时快速失败，避免溢出为负导致静默空输出）
     CHECK_LE(total, std::numeric_limits<int>::max());
     int threads_per_block = 256;
     int num_blocks = static_cast<int>((total + threads_per_block - 1) / threads_per_block);
@@ -88,7 +88,7 @@ std::shared_ptr<Tensor> MatmulForward(const std::shared_ptr<Tensor> &input, cons
     return output;
 }
 
-// restrict 承诺：写目标（grad_input）必须与读源（grad_output/other）不重叠，原地调用属未定义行为  // Fix CR#L26-L28
+// restrict 承诺：写目标（grad_input）必须与读源（grad_output/other）不重叠，原地调用属未定义行为
 __global__ void MatmulBackwardGradInputKernel(const float *__restrict__ grad_output, const float *__restrict__ other,
                                               float *__restrict__ grad_input, int rows, int in_features,
                                               int out_features, int total) {
@@ -104,7 +104,7 @@ __global__ void MatmulBackwardGradInputKernel(const float *__restrict__ grad_out
     // grad_input[batch][row][k] = Σ_c grad_output[batch][row][c] * other[batch][k][c]
     // c 串行累加保证 GPU 侧运行位级确定；warp 内相邻线程（k 连续）读 other 为按列访问（非 coalesced）——
     // A×B^T 结构在无共享内存的 naive 形态下两操作数无法同时行主序访问，当前映射已保证输出写 coalesced
-    // 与 grad_output 广播读，教学定位保持现状  // Fix CR#L86-L106, L98
+    // 与 grad_output 广播读，教学定位保持现状
     float sum = 0.0f;
     const float *grad_output_row = grad_output + (batch * rows + row) * out_features;
     const float *other_base = other + (batch * in_features + k) * out_features;
@@ -114,7 +114,7 @@ __global__ void MatmulBackwardGradInputKernel(const float *__restrict__ grad_out
     grad_input[idx] = sum;
 }
 
-// restrict 承诺：写目标（grad_other）必须与读源（input/grad_output）不重叠，原地调用属未定义行为  // Fix CR#L26-L28
+// restrict 承诺：写目标（grad_other）必须与读源（input/grad_output）不重叠，原地调用属未定义行为
 __global__ void MatmulBackwardGradOtherKernel(const float *__restrict__ input, const float *__restrict__ grad_output,
                                               float *__restrict__ grad_other, int rows, int in_features,
                                               int out_features, int total) {
@@ -128,7 +128,7 @@ __global__ void MatmulBackwardGradOtherKernel(const float *__restrict__ input, c
     int batch = tmp / in_features;
 
     // grad_other[batch][k][col] = Σ_r input[batch][row][k] * grad_output[batch][row][col]
-    // r 串行累加保证 GPU 侧运行位级确定；warp 内相邻线程（col 连续）grad_output 与写均 coalesced  // Fix CR#L120
+    // r 串行累加保证 GPU 侧运行位级确定；warp 内相邻线程（col 连续）grad_output 与写均 coalesced
     float sum = 0.0f;
     const float *input_base = input + (batch * rows) * in_features + k;
     const float *grad_output_base = grad_output + (batch * rows) * out_features + col;
@@ -163,7 +163,7 @@ MatmulBackward(const std::shared_ptr<Tensor> &input, const std::shared_ptr<Tenso
         CHECK_EQ(input_dims[dim], other_dims[dim]);
     }
     CHECK_EQ(in_features, *(other_dims.rbegin() + 1));
-    // Fix CR#L160-L161：设备一致性校验（跨设备误用快速失败而非异步运行时错误）
+    // 设备一致性校验（跨设备误用快速失败而非异步运行时错误）
     CHECK_EQ(static_cast<int>(input->GetDevice().Type()), static_cast<int>(other->GetDevice().Type()));
     CHECK_EQ(static_cast<int>(input->GetDevice().Type()), static_cast<int>(grad_output->GetDevice().Type()));
 
@@ -176,7 +176,7 @@ MatmulBackward(const std::shared_ptr<Tensor> &input, const std::shared_ptr<Tenso
 
     // 两个 kernel 均为一元素一线程 + 边界检查，串行内层循环保证 GPU 侧运行位级确定
     const int64_t grad_input_total = batch * rows * in_features;
-    // Fix CR#L164-L177：32 位索引范围防护（total 超出 int 范围时快速失败，避免静默错误）
+    // 32 位索引范围防护（total 超出 int 范围时快速失败，避免静默错误）
     CHECK_LE(grad_input_total, std::numeric_limits<int>::max());
     int threads_per_block = 256;
     int num_blocks = static_cast<int>((grad_input_total + threads_per_block - 1) / threads_per_block);

@@ -1,4 +1,4 @@
-#include <cmath>  // Fix CR#L1-L5
+#include <cmath>
 #include <cstddef>
 #include <memory>
 
@@ -21,10 +21,10 @@ void AdamAccumulateGrad(const std::shared_ptr<Tensor> &grad, const std::shared_p
     // =================================== 作业 ===================================
     // 标准 Adam（含偏差校正）：m = β1*m + (1-β1)*g，v = β2*v + (1-β2)*g²，
     // param -= lr * m̂ / (√v̂ + eps)，其中 m̂ = m/(1-β1^t)，v̂ = v/(1-β2^t)，t 从 1 开始
-    CHECK_EQ(grad->NumElements(), param->NumElements());  // Fix CR#L23-L27：防直接调用 kernel 时越界读写
+    CHECK_EQ(grad->NumElements(), param->NumElements());  // 校验各张量元素数一致，防止直接调用时越界读写
     CHECK_EQ(m->NumElements(), param->NumElements());
     CHECK_EQ(v->NumElements(), param->NumElements());
-    // 偏差校正因子仅依赖步数，与元素无关，提升到循环外计算一次（double 对齐 PyTorch 标量路径的双精度惯例）  // Fix CR#L31-L32
+    // 偏差校正因子仅依赖步数，与元素无关，提升到循环外计算一次（double 对齐 PyTorch 标量路径的双精度惯例）
     const double beta1_t = std::pow(static_cast<double>(beta1), static_cast<double>(t));
     const double beta2_t = std::pow(static_cast<double>(beta2), static_cast<double>(t));
     for (int64_t idx = 0; idx < param->NumElements(); ++idx) {

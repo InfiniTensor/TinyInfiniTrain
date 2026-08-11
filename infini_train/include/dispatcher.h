@@ -50,7 +50,7 @@ public:
         // 功能描述：将kernel函数与设备类型、名称绑定
         // =================================== 作业 ===================================
         CHECK(!key_to_kernel_map_.contains(key))
-            << "Kernel already registered: " << key.second << " on device: " << static_cast<int>(key.first);  // Fix CR#L52
+            << "Kernel already registered: " << key.second << " on device: " << static_cast<int>(key.first);
         key_to_kernel_map_.emplace(key, KernelFunction(std::forward<FuncT>(kernel)));
     }
 

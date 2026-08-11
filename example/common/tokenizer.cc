@@ -109,7 +109,7 @@ void Tokenizer::GenerateText(infini_train::nn::Module &model, uint32_t batch_siz
                              uint32_t text_length, Device device) const {
     std::vector<int64_t> dims;
     dims.assign({batch_size, sequence_length});
-    // x_tensor (FLAGS_batch_size, FLAGS_sequence_length) eq:(4, 64)
+    // x_tensor 形状为 (batch_size, sequence_length)
     infini_train::Tensor x_tensor = infini_train::Tensor(dims, DataType::kINT64);
     int64_t *x_buff = static_cast<int64_t *>(x_tensor.DataPtr());
     for (int i = 0; i < batch_size * sequence_length; ++i) { x_buff[i] = eot_token_; }
@@ -129,7 +129,10 @@ void Tokenizer::GenerateText(infini_train::nn::Module &model, uint32_t batch_siz
         HINT：调用model.Forward推理获取logits，根据推理结果进行随机采样，调用Decode获取文本结果
         ===================================== 作业 ===================================== */
         // 生成场景无 Backward：临时禁用参数梯度使前向不建 autograd 图（Function 即时释放），
-        // 避免算子 saved_tensors_ 的循环引用在无 Backward 场景下导致显存逐步入泄漏
+        // 避免算子 saved_tensors_ 的循环引用在无 Backward 场景下导致显存逐步泄漏。
+        // 副作用说明：本方法（const 签名）临时修改模型参数的 requires_grad 状态——生成区间禁用、
+        // 末步恢复为 true；若生成中途以异常中断，requires_grad 将残留为 false，需重新调用
+        // set_requires_grad(true) 恢复训练（本框架错误处理为 CHECK 快速失败，正常路径不触发）
         if (t == prompt_len) {
             for (auto &param : model.Parameters()) { param->set_requires_grad(false); }
         }
@@ -165,7 +168,9 @@ void Tokenizer::GenerateText(infini_train::nn::Module &model, uint32_t batch_siz
                 probs[i] /= sum_exp;
             }
 
-            static uint64_t rng_state = kRngState;
+            // 函数开头声明了与命名空间常量同名的局部变量 `kRngState = kRngState;`（自初始化，未定义行为），
+            // 此处显式引用命名空间常量 kRngState（=1337，与 llm.c 固定种子一致）保证生成可复现
+            static uint64_t rng_state = infini_train::kRngState;
             const int next_token = SampleMult(probs.data(), static_cast<int>(vocab_size), RandomF32(rng_state));
             x_buff[b * sequence_length + t] = next_token;
             std::cout << Decode(next_token);

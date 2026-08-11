@@ -21,7 +21,7 @@ std::shared_ptr<Tensor> MatmulForward(const std::shared_ptr<Tensor> &input, cons
     CHECK_EQ(input_dims.size(), other_dims.size());
 
     // input[batch..., rows, in_features] × other[batch..., in_features, out_features] -> output[batch..., rows, out_features]
-    // 逐 batch 严格相等（batch 维不支持 torch.matmul 的广播语义）  // Fix CR#L30-L33
+    // 逐 batch 严格相等（batch 维不支持 torch.matmul 的广播语义）
     const int64_t batch_ndim = input_dims.size() - 2;
     const int64_t batch =
         std::accumulate(input_dims.begin(), input_dims.begin() + batch_ndim, 1, std::multiplies<int64_t>{});
@@ -40,7 +40,7 @@ std::shared_ptr<Tensor> MatmulForward(const std::shared_ptr<Tensor> &input, cons
     const float *input_data = static_cast<const float *>(input->DataPtr());
     const float *other_data = static_cast<const float *>(other->DataPtr());
     float *output_data = static_cast<float *>(output->DataPtr());
-    // 循环次序 r->k->c（内层 c）：other 与 output 沿连续方向访问（缓存友好），output 先清零再累积  // Fix CR#L42-L53
+    // 循环次序 r->k->c（内层 c）：other 与 output 沿连续方向访问（缓存友好），output 先清零再累积
     const int64_t output_size = batch * rows * out_features;
     for (int64_t idx = 0; idx < output_size; ++idx) {
         output_data[idx] = 0.0f;
@@ -73,7 +73,7 @@ MatmulBackward(const std::shared_ptr<Tensor> &input, const std::shared_ptr<Tenso
     CHECK_EQ(input_dims.size(), other_dims.size());
 
     // grad_input = grad_output × other^T，grad_other = input^T × grad_output
-    // 逐 batch 严格相等（batch 维不支持 torch.matmul 的广播语义）  // Fix CR#L77-L80
+    // 逐 batch 严格相等（batch 维不支持 torch.matmul 的广播语义）
     const int64_t batch_ndim = input_dims.size() - 2;
     const int64_t batch =
         std::accumulate(input_dims.begin(), input_dims.begin() + batch_ndim, 1, std::multiplies<int64_t>{});
@@ -98,7 +98,7 @@ MatmulBackward(const std::shared_ptr<Tensor> &input, const std::shared_ptr<Tenso
     float *grad_input_data = static_cast<float *>(grad_input->DataPtr());
     float *grad_other_data = static_cast<float *>(grad_other->DataPtr());
     // grad_other[b][k][c] = Σ_r input[b][r][k] * grad_output[b][r][c]
-    // 循环次序 k->r->c（内层 c）：grad_output 与 grad_other 沿连续方向访问（缓存友好），grad_other 先清零  // Fix CR#L94-L115
+    // 循环次序 k->r->c（内层 c）：grad_output 与 grad_other 沿连续方向访问（缓存友好），grad_other 先清零
     const int64_t grad_other_size = batch * in_features * out_features;
     for (int64_t idx = 0; idx < grad_other_size; ++idx) {
         grad_other_data[idx] = 0.0f;

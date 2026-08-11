@@ -58,9 +58,9 @@ void AdamAccumulateGrad(const std::shared_ptr<Tensor> &grad, const std::shared_p
     const double beta2_t = std::pow(static_cast<double>(beta2), static_cast<double>(t));
 
     size_t num_elements = param->NumElements();
-    // Fix CR#L29-L30：32 位索引范围防护（超过 int 范围时快速失败，避免后半元素静默不处理）
+    // 32 位索引范围防护（超过 int 范围时快速失败，避免后半元素静默不处理）
     CHECK_LE(num_elements, static_cast<size_t>(std::numeric_limits<int>::max()));
-    // Fix CR#L25-L28：kernel 的 restrict 承诺要求写目标（param/m/v）与读源（grad）互不重叠（原地调用属未定义行为）
+    // kernel 的 restrict 承诺要求写目标（param/m/v）与读源（grad）互不重叠（原地调用属未定义行为）
     const float *grad_ptr = static_cast<const float *>(grad->DataPtr());
     float *param_ptr = static_cast<float *>(param->DataPtr());
     float *m_ptr = static_cast<float *>(m->DataPtr());
