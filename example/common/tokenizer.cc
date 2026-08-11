@@ -78,6 +78,22 @@ Tokenizer::Tokenizer(const std::string &filepath) {
     | magic(4B) | version(4B) | vocab_size(4B) | reserved(1012B) | token词表数据       |
     ----------------------------------------------------------------------------------
     ===================================== 作业 ===================================== */
+    std::ifstream ifs(filepath, std::ios::binary);
+    CHECK(ifs.is_open()) << "Failed to open tokenizer file: " << filepath;
+
+    auto header = ReadSeveralBytesFromIfstream(1024, &ifs);
+    magic_number_ = BytesToType<uint32_t>(header, 0);
+    vocab_size_ = BytesToType<uint32_t>(header, 8);
+    eot_token_ = BytesToType<uint32_t>(header, 12);
+    CHECK(kEotMap.contains(magic_number_)) << "Unsupported tokenizer magic number: " << magic_number_;
+
+    // 词表格式（与 llm.c gpt2_tokenizer.bin 一致）：每个 token 为 1 字节长度前缀 + 原始字节
+    token_table_.reserve(vocab_size_);
+    for (uint32_t i = 0; i < vocab_size_; ++i) {
+        const uint8_t len = BytesToType<uint8_t>(ReadSeveralBytesFromIfstream(1, &ifs), 0);
+        auto bytes = ReadSeveralBytesFromIfstream(len, &ifs);
+        token_table_.emplace_back(reinterpret_cast<const char *>(bytes.data()), len);
+    }
 }
 
 std::string Tokenizer::Decode(uint32_t token_id) const {
@@ -85,7 +101,8 @@ std::string Tokenizer::Decode(uint32_t token_id) const {
     TODO：实现token_id到文本的转换
     功能描述：根据token_id返回对应的文本片段
     ===================================== 作业 ===================================== */
-    return "";
+    CHECK_LT(token_id, vocab_size_) << "token_id out of range: " << token_id;
+    return token_table_[token_id];
 }
 
 void Tokenizer::GenerateText(infini_train::nn::Module &model, uint32_t batch_size, uint32_t sequence_length,
@@ -111,6 +128,48 @@ void Tokenizer::GenerateText(infini_train::nn::Module &model, uint32_t batch_siz
         TODO：实现单步文本生成逻辑
         HINT：调用model.Forward推理获取logits，根据推理结果进行随机采样，调用Decode获取文本结果
         ===================================== 作业 ===================================== */
+        // 生成场景无 Backward：临时禁用参数梯度使前向不建 autograd 图（Function 即时释放），
+        // 避免算子 saved_tensors_ 的循环引用在无 Backward 场景下导致显存逐步入泄漏
+        if (t == prompt_len) {
+            for (auto &param : model.Parameters()) { param->set_requires_grad(false); }
+        }
+        // 同步 host 输入到目标设备并前向推理
+        x = std::make_shared<infini_train::Tensor>(x_tensor.To(device));
+        auto outputs = model.Forward({x});
+        auto logits = outputs[0];
+        auto logits_cpu = logits->To(Device(DeviceType::kCPU, 0));
+        const float *logits_data = static_cast<const float *>(logits_cpu.DataPtr());
+        const int64_t vocab_size = logits->Dims()[2];
+        // 恢复参数梯度（后续训练仍需要建图反向）
+        if (t == text_length - 1) {
+            for (auto &param : model.Parameters()) { param->set_requires_grad(true); }
+        }
+
+        // 生成语义（对齐 llm.c）：取位置 t-1 的分布预测位置 t 的 token，每 batch 独立采样写回
+        std::vector<float> probs(static_cast<size_t>(vocab_size));
+        for (uint32_t b = 0; b < batch_size; ++b) {
+            const float *logits_at_t = logits_data + (b * sequence_length + t - 1) * vocab_size;
+            // softmax（数值稳定：先减最大值）
+            float max_logit = logits_at_t[0];
+            for (int64_t i = 1; i < vocab_size; ++i) {
+                if (logits_at_t[i] > max_logit) {
+                    max_logit = logits_at_t[i];
+                }
+            }
+            float sum_exp = 0.0f;
+            for (int64_t i = 0; i < vocab_size; ++i) {
+                probs[i] = std::exp(logits_at_t[i] - max_logit);
+                sum_exp += probs[i];
+            }
+            for (int64_t i = 0; i < vocab_size; ++i) {
+                probs[i] /= sum_exp;
+            }
+
+            static uint64_t rng_state = kRngState;
+            const int next_token = SampleMult(probs.data(), static_cast<int>(vocab_size), RandomF32(rng_state));
+            x_buff[b * sequence_length + t] = next_token;
+            std::cout << Decode(next_token);
+        }
     }
     std::cout << std::endl;
 }

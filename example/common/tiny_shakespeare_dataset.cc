@@ -61,10 +61,38 @@ TinyShakespeareFile ReadTinyShakespeareFile(const std::string &path, size_t sequ
     | magic(4B) | version(4B) | num_toks(4B) | reserved(1012B) | token数据           |
     ----------------------------------------------------------------------------------
        =================================== 作业 =================================== */
+    std::ifstream ifs(path, std::ios::binary);
+    CHECK(ifs.is_open()) << "Failed to open file: " << path;
+
+    auto header = ReadSeveralBytesFromIfstream(1024, &ifs);
+    const int magic = BytesToType<int>(header, 0);
+    const int num_toks = BytesToType<int>(header, 8);
+    CHECK(kTypeMap.contains(magic)) << "Unsupported magic number: " << magic;
+
+    TinyShakespeareFile file;
+    file.type = kTypeMap.at(magic);
+    const size_t token_size = kTypeToSize.at(file.type);
+
+    // 读 token 流并转为 int64 张量：CrossEntropy 的 target 要求 int64，
+    // 且 operator[] 中 y 的偏移 sizeof(int64_t) = 8 字节恰为 1 个 int64 token（右移 1 token 语义）
+    auto token_bytes = ReadSeveralBytesFromIfstream(static_cast<size_t>(num_toks) * token_size, &ifs);
+    const size_t num_samples = static_cast<size_t>(num_toks) / sequence_length;
+    file.dims = {static_cast<int64_t>(num_samples), static_cast<int64_t>(sequence_length)};
+    file.tensor = infini_train::Tensor(file.dims, DataType::kINT64);
+    int64_t *tensor_data = static_cast<int64_t *>(file.tensor.DataPtr());
+    for (size_t i = 0; i < num_samples * sequence_length; ++i) {
+        tensor_data[i] = (token_size == 2) ? BytesToType<uint16_t>(token_bytes, i * 2)
+                                           : BytesToType<int32_t>(token_bytes, i * 4);
+    }
+    return file;
 }
 } // namespace
 
-TinyShakespeareDataset::TinyShakespeareDataset(const std::string &filepath, size_t sequence_length) {
+TinyShakespeareDataset::TinyShakespeareDataset(const std::string &filepath, size_t sequence_length)
+    : text_file_(ReadTinyShakespeareFile(filepath, sequence_length)),
+      sequence_length_(sequence_length),
+      sequence_size_in_bytes_(sequence_length * sizeof(int64_t)),
+      num_samples_(text_file_.dims[0]) {
     // =================================== 作业 ===================================
     // TODO：初始化数据集实例
     // HINT: 调用ReadTinyShakespeareFile加载数据文件
