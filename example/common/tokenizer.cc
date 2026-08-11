@@ -82,6 +82,7 @@ Tokenizer::Tokenizer(const std::string &filepath) {
     CHECK(ifs.is_open()) << "Failed to open tokenizer file: " << filepath;
 
     auto header = ReadSeveralBytesFromIfstream(1024, &ifs);
+    CHECK_EQ(ifs.gcount(), 1024) << "Truncated header in file: " << filepath;
     magic_number_ = BytesToType<uint32_t>(header, 0);
     vocab_size_ = BytesToType<uint32_t>(header, 8);
     eot_token_ = BytesToType<uint32_t>(header, 12);
@@ -94,6 +95,8 @@ Tokenizer::Tokenizer(const std::string &filepath) {
         auto bytes = ReadSeveralBytesFromIfstream(len, &ifs);
         token_table_.emplace_back(reinterpret_cast<const char *>(bytes.data()), len);
     }
+    // 词表读取完整性校验：任一项读取失败（文件截断）都会置位 failbit，快速失败而非静默加载垃圾词表
+    CHECK(ifs) << "Truncated tokenizer vocab table in file: " << filepath;
 }
 
 std::string Tokenizer::Decode(uint32_t token_id) const {

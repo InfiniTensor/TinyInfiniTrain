@@ -283,7 +283,7 @@ std::shared_ptr<Tensor> Tensor::Flatten(int64_t start, int64_t end) {
     // HINT:
     // =================================== 作业 ===================================
     if (dims_.empty()) {
-        // 零维张量（标量）无维度可合并，返回原张量（对齐 PyTorch 0 维 flatten 语义）
+        // 零维张量（标量）无维度可合并，返回原张量（教学框架简化语义；PyTorch 现行为对 0 维 flatten 返回一维视图）
         return shared_from_this();
     }
     if (start < 0) {

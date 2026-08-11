@@ -108,7 +108,8 @@ TinyShakespeareDataset::TinyShakespeareDataset(const std::string &filepath, size
 
 std::pair<std::shared_ptr<infini_train::Tensor>, std::shared_ptr<infini_train::Tensor>>
 TinyShakespeareDataset::operator[](size_t idx) const {
-    CHECK_LT(idx, text_file_.dims[0] - 1);
+    // 以 num_samples_（可访问样本数，构造时已防护空数据集）限定边界，与 Size 契约一致
+    CHECK_LT(idx, num_samples_);
     std::vector<int64_t> dims = std::vector<int64_t>(text_file_.dims.begin() + 1, text_file_.dims.end());
     // x/y 与 text_file_.tensor 共享 buffer：x 取第 idx 个序列，y 偏移一个 token（预测下一 token）
     return {std::make_shared<infini_train::Tensor>(text_file_.tensor, idx * sequence_size_in_bytes_, dims),

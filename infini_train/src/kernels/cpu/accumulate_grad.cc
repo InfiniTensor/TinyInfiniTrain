@@ -24,6 +24,7 @@ void AdamAccumulateGrad(const std::shared_ptr<Tensor> &grad, const std::shared_p
     CHECK_EQ(grad->NumElements(), param->NumElements());  // 校验各张量元素数一致，防止直接调用时越界读写
     CHECK_EQ(m->NumElements(), param->NumElements());
     CHECK_EQ(v->NumElements(), param->NumElements());
+    CHECK_GE(t, 1);  // Adam 偏差校正要求 t 从 1 开始（t=0 时 1-β^t=0，除零产生 NaN）
     // 偏差校正因子仅依赖步数，与元素无关，提升到循环外计算一次（double 对齐 PyTorch 标量路径的双精度惯例）
     const double beta1_t = std::pow(static_cast<double>(beta1), static_cast<double>(t));
     const double beta2_t = std::pow(static_cast<double>(beta2), static_cast<double>(t));
