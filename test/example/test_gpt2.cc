@@ -1,6 +1,5 @@
 #include <chrono>
 #include <cstdlib>
-#include <format>
 #include <memory>
 #include <optional>
 #include <unordered_map>

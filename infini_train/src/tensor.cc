@@ -4,6 +4,7 @@
 #include <cstring>
 #include <fstream>
 #include <functional>
+#include <iomanip>
 #include <memory>
 #include <numeric>
 #include <unordered_map>
@@ -16,6 +17,7 @@
 #include "glog/logging.h"
 
 #include "infini_train/include/autograd/elementwise.h"
+#include "infini_train/include/autograd/function.h"
 #include "infini_train/include/autograd/matmul.h"
 #include "infini_train/include/autograd/misc.h"
 #include "infini_train/include/autograd/outer.h"
@@ -282,8 +284,31 @@ std::shared_ptr<Tensor> Tensor::Flatten(int64_t start, int64_t end) {
     // TODO：实现张量扁平化操作，将指定维度范围[start, end]内的所有维度合并为一个维度
     // HINT:
     // =================================== 作业 ===================================
+    const int64_t ndim = static_cast<int64_t>(dims_.size());
+    if (start < 0) {
+        start += ndim;
+    }
+    if (end < 0) {
+        end += ndim;
+    }
+    CHECK_GE(start, 0);
+    CHECK_GE(end, start);
+    CHECK_LT(end, ndim);
 
-    return std::make_shared<Tensor>();
+    std::vector<int64_t> new_shape;
+    new_shape.reserve(static_cast<size_t>(ndim - (end - start)));
+    for (int64_t i = 0; i < start; ++i) {
+        new_shape.push_back(dims_[i]);
+    }
+    int64_t flattened = 1;
+    for (int64_t i = start; i <= end; ++i) {
+        flattened *= dims_[i];
+    }
+    new_shape.push_back(flattened);
+    for (int64_t i = end + 1; i < ndim; ++i) {
+        new_shape.push_back(dims_[i]);
+    }
+    return Contiguous()->View(new_shape);
 }
 
 std::shared_ptr<Tensor> Tensor::Squeeze(int64_t dim) {
@@ -358,6 +383,30 @@ void Tensor::Backward(std::shared_ptr<Tensor> gradient, bool retain_graph, bool 
     // TODO：实现自动微分反向传播
     // 功能描述：1. 计算当前张量对叶子节点的梯度    2. 支持多输出场景的梯度累加
     // =================================== 作业 ===================================
+    (void)retain_graph;
+    (void)create_graph;
+    if (!requires_grad_) {
+        return;
+    }
+
+    if (!gradient) {
+        if (NumElements() == 1) {
+            gradient = std::make_shared<Tensor>(dims_, dtype_, GetDevice());
+            gradient->Fill<float>(1.0f);
+        } else {
+            LOG(FATAL) << "grad can be implicitly created only for scalar outputs";
+        }
+    }
+
+    if (grad_fn_) {
+        grad_fn_->BackwardPartial(gradient, output_idx_);
+    } else if (is_leaf_) {
+        if (grad_) {
+            auto device = grad_->GetDevice().Type();
+            auto kernel = Dispatcher::Instance().GetKernel({device, "AccumulateGrad"});
+            kernel.Call<void>(gradient, 1.0f, grad_);
+        }
+    }
 }
 
 void Tensor::ZeroGrad() {
