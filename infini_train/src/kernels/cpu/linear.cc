@@ -16,8 +16,58 @@ std::shared_ptr<Tensor> MatmulForward(const std::shared_ptr<Tensor> &input, cons
     // REF:
     // =================================== 作业 ===================================
 
-    auto output = std::make_shared<Tensor>();
-    return {output};
+    const auto &input_dims = input->Dims();
+    const auto &other_dims = other->Dims();
+    CHECK_GE(input_dims.size(), 2);
+    CHECK_GE(other_dims.size(), 2);
+    const int64_t M = input_dims[input_dims.size() - 2];
+    const int64_t K = input_dims[input_dims.size() - 1];
+    const int64_t N = other_dims[other_dims.size() - 1];
+    CHECK_EQ(K, other_dims[other_dims.size() - 2]);
+
+    // Determine batch dimensions
+    int64_t batch_input = 1;
+    for (size_t i = 0; i < input_dims.size() - 2; ++i) {
+        batch_input *= input_dims[i];
+    }
+    int64_t batch_other = 1;
+    for (size_t i = 0; i < other_dims.size() - 2; ++i) {
+        batch_other *= other_dims[i];
+    }
+    int64_t batch = std::max(batch_input, batch_other);
+
+    // Build output dims
+    std::vector<int64_t> output_dims;
+    if (batch > 1) {
+        output_dims = (input_dims.size() >= other_dims.size()) ? input_dims : other_dims;
+        output_dims[output_dims.size() - 2] = M;
+        output_dims[output_dims.size() - 1] = N;
+    } else {
+        output_dims = {M, N};
+    }
+
+    auto output = std::make_shared<Tensor>(output_dims, DataType::kFLOAT32);
+
+    float *input_ptr = static_cast<float *>(input->DataPtr());
+    float *other_ptr = static_cast<float *>(other->DataPtr());
+    float *output_ptr = static_cast<float *>(output->DataPtr());
+
+    for (int64_t b = 0; b < batch; ++b) {
+        int64_t input_offset = (batch_input == 1) ? 0 : b * M * K;
+        int64_t other_offset = (batch_other == 1) ? 0 : b * K * N;
+        int64_t output_offset = b * M * N;
+
+        Eigen::Map<const Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> input_mat(
+            input_ptr + input_offset, M, K);
+        Eigen::Map<const Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> other_mat(
+            other_ptr + other_offset, K, N);
+        Eigen::Map<Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> output_mat(
+            output_ptr + output_offset, M, N);
+
+        output_mat = input_mat * other_mat;
+    }
+
+    return output;
 }
 
 std::tuple<std::shared_ptr<Tensor>, std::shared_ptr<Tensor>>
@@ -28,8 +78,55 @@ MatmulBackward(const std::shared_ptr<Tensor> &input, const std::shared_ptr<Tenso
     // REF:
     // =================================== 作业 ===================================
 
-    auto grad_input = std::make_shared<Tensor>();
-    auto grad_other = std::make_shared<Tensor>();
+    const auto &input_dims = input->Dims();
+    const auto &other_dims = other->Dims();
+    const int64_t M = input_dims[input_dims.size() - 2];
+    const int64_t K = input_dims[input_dims.size() - 1];
+    const int64_t N = other_dims[other_dims.size() - 1];
+
+    int64_t batch_input = 1;
+    for (size_t i = 0; i < input_dims.size() - 2; ++i) {
+        batch_input *= input_dims[i];
+    }
+    int64_t batch_other = 1;
+    for (size_t i = 0; i < other_dims.size() - 2; ++i) {
+        batch_other *= other_dims[i];
+    }
+    int64_t batch = std::max(batch_input, batch_other);
+
+    auto grad_input = std::make_shared<Tensor>(input_dims, DataType::kFLOAT32);
+    auto grad_other = std::make_shared<Tensor>(other_dims, DataType::kFLOAT32);
+
+    float *input_ptr = static_cast<float *>(input->DataPtr());
+    float *other_ptr = static_cast<float *>(other->DataPtr());
+    float *grad_output_ptr = static_cast<float *>(grad_output->DataPtr());
+    float *grad_input_ptr = static_cast<float *>(grad_input->DataPtr());
+    float *grad_other_ptr = static_cast<float *>(grad_other->DataPtr());
+
+    for (int64_t b = 0; b < batch; ++b) {
+        int64_t input_offset = (batch_input == 1) ? 0 : b * M * K;
+        int64_t other_offset = (batch_other == 1) ? 0 : b * K * N;
+        int64_t grad_output_offset = b * M * N;
+        int64_t grad_input_offset = (batch_input == 1) ? 0 : b * M * K;
+        int64_t grad_other_offset = (batch_other == 1) ? 0 : b * K * N;
+
+        Eigen::Map<const Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> input_mat(
+            input_ptr + input_offset, M, K);
+        Eigen::Map<const Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> other_mat(
+            other_ptr + other_offset, K, N);
+        Eigen::Map<const Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> grad_output_mat(
+            grad_output_ptr + grad_output_offset, M, N);
+        Eigen::Map<Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> grad_input_mat(
+            grad_input_ptr + grad_input_offset, M, K);
+        Eigen::Map<Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> grad_other_mat(
+            grad_other_ptr + grad_other_offset, K, N);
+
+        // dX = dY * W^T
+        grad_input_mat = grad_output_mat * other_mat.transpose();
+        // dW = X^T * dY
+        grad_other_mat = input_mat.transpose() * grad_output_mat;
+    }
+
     return {grad_input, grad_other};
 }
 

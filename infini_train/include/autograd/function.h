@@ -7,6 +7,17 @@
 #include "infini_train/include/tensor.h"
 
 namespace infini_train::autograd {
+
+class NoGradGuard {
+public:
+    NoGradGuard() { ++depth_; }
+    ~NoGradGuard() { --depth_; }
+    static bool is_enabled() { return depth_ > 0; }
+
+private:
+    static thread_local int depth_;
+};
+
 class Function : public std::enable_shared_from_this<Function> {
 public:
     static constexpr char kUndefinedType[] = "Undefined";

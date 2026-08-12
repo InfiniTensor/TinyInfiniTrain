@@ -9,6 +9,9 @@
 
 #include "glog/logging.h"
 
+#include "infini_train/include/autograd/function.h"
+#include "infini_train/include/nn/functional.h"
+
 namespace infini_train {
 
 constexpr uint32_t kGpt2Eot = 50256;
@@ -78,6 +81,34 @@ Tokenizer::Tokenizer(const std::string &filepath) {
     | magic(4B) | version(4B) | vocab_size(4B) | reserved(1012B) | token词表数据       |
     ----------------------------------------------------------------------------------
     ===================================== 作业 ===================================== */
+
+    std::ifstream ifs(filepath, std::ios::binary);
+    CHECK(ifs.is_open()) << "Failed to open tokenizer file: " << filepath;
+
+    // Read header (1024 bytes)
+    auto header = ReadSeveralBytesFromIfstream(1024, &ifs);
+
+    magic_number_ = BytesToType<uint32_t>(header, 0);
+    uint32_t version = BytesToType<uint32_t>(header, 4);
+    vocab_size_ = BytesToType<uint32_t>(header, 8);
+
+    CHECK(kEotMap.contains(magic_number_)) << "Unknown magic number: " << magic_number_;
+    eot_token_ = kEotMap.at(magic_number_);
+
+    // Read vocab table
+    token_table_.resize(vocab_size_);
+    constexpr size_t kMaxTokenLength = 1024;
+    for (uint32_t i = 0; i < vocab_size_; ++i) {
+        auto len_bytes = ReadSeveralBytesFromIfstream(sizeof(uint8_t), &ifs);
+        uint32_t token_len = BytesToType<uint8_t>(len_bytes, 0);
+        CHECK_LE(token_len, kMaxTokenLength) << "Token too long: " << token_len;
+        auto token_bytes = ReadSeveralBytesFromIfstream(token_len, &ifs);
+        token_table_[i] = std::string(reinterpret_cast<char *>(token_bytes.data()), token_len);
+        // Strip trailing whitespace
+        while (!token_table_[i].empty() && std::isspace(token_table_[i].back())) {
+            token_table_[i].pop_back();
+        }
+    }
 }
 
 std::string Tokenizer::Decode(uint32_t token_id) const {
@@ -85,7 +116,8 @@ std::string Tokenizer::Decode(uint32_t token_id) const {
     TODO：实现token_id到文本的转换
     功能描述：根据token_id返回对应的文本片段
     ===================================== 作业 ===================================== */
-    return "";
+    CHECK_LT(token_id, token_table_.size()) << "Token ID out of range: " << token_id;
+    return token_table_[token_id];
 }
 
 void Tokenizer::GenerateText(infini_train::nn::Module &model, uint32_t batch_size, uint32_t sequence_length,
@@ -106,11 +138,41 @@ void Tokenizer::GenerateText(infini_train::nn::Module &model, uint32_t batch_siz
     auto x = std::make_shared<infini_train::Tensor>(x_tensor.To(device));
     uint64_t kRngState = kRngState;
     LOG(INFO) << "start generate text:";
-    for (int t = prompt_len; t < text_length; t++) {
+    {
+        autograd::NoGradGuard no_grad;
+        for (int t = prompt_len; t < text_length; t++) {
         /* ===================================== 作业 =====================================
         TODO：实现单步文本生成逻辑
         HINT：调用model.Forward推理获取logits，根据推理结果进行随机采样，调用Decode获取文本结果
         ===================================== 作业 ===================================== */
+
+        // Forward pass
+        auto logits = model.Forward({x})[0];
+
+        // Get logits for the last token position (position t-1)
+        auto last_logits = logits->Slice(1, t - 1, t, 1);
+        // Squeeze the sequence dimension: (batch_size, 1, vocab_size) -> (batch_size, vocab_size)
+        last_logits = last_logits->Squeeze(1);
+
+        // Apply softmax to get probabilities
+        auto probs = infini_train::nn::function::Softmax(last_logits, -1);
+
+        // Sample from the probability distribution for each batch
+        auto probs_cpu = probs->To(Device(DeviceType::kCPU, 0));
+        float *probs_ptr = static_cast<float *>(probs_cpu.DataPtr());
+        int64_t vocab_size = probs_cpu.Dims().back();
+
+        for (int b = 0; b < batch_size; ++b) {
+            float coin = RandomF32(kRngState);
+            int next_token = SampleMult(probs_ptr + b * vocab_size, vocab_size, coin);
+            x_buff[b * sequence_length + t] = next_token;
+            std::cout << Decode(next_token);
+        }
+        std::cout.flush();
+
+        // Update the device tensor with the new token
+        x = std::make_shared<infini_train::Tensor>(x_tensor.To(device));
+        }
     }
     std::cout << std::endl;
 }
