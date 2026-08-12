@@ -282,8 +282,32 @@ std::shared_ptr<Tensor> Tensor::Flatten(int64_t start, int64_t end) {
     // TODO：实现张量扁平化操作，将指定维度范围[start, end]内的所有维度合并为一个维度
     // HINT:
     // =================================== 作业 ===================================
+    if (dims_.empty()) {
+        // 零维张量（标量）无维度可合并，返回原张量（教学框架简化语义；PyTorch 现行为对 0 维 flatten 返回一维视图）
+        return shared_from_this();
+    }
+    if (start < 0) {
+        start += dims_.size();
+    }
+    if (end < 0) {
+        end += dims_.size();
+    }
+    CHECK_GE(start, 0);
+    CHECK_LT(start, dims_.size());
+    CHECK_GE(end, start);
+    CHECK_LT(end, dims_.size());
 
-    return std::make_shared<Tensor>();
+    int64_t flattened_dim = 1;
+    for (int64_t dim = start; dim <= end; ++dim) {
+        flattened_dim *= dims_[dim];
+    }
+
+    std::vector<int64_t> new_shape;
+    new_shape.insert(new_shape.end(), dims_.begin(), dims_.begin() + start);
+    new_shape.push_back(flattened_dim);
+    new_shape.insert(new_shape.end(), dims_.begin() + end + 1, dims_.end());
+
+    return Contiguous()->View(new_shape);
 }
 
 std::shared_ptr<Tensor> Tensor::Squeeze(int64_t dim) {
@@ -358,6 +382,23 @@ void Tensor::Backward(std::shared_ptr<Tensor> gradient, bool retain_graph, bool 
     // TODO：实现自动微分反向传播
     // 功能描述：1. 计算当前张量对叶子节点的梯度    2. 支持多输出场景的梯度累加
     // =================================== 作业 ===================================
+    if (!gradient) {
+        // 无参调用（对应 PyTorch 标量输出 tensor.backward() 语义）：默认梯度为全 1
+        // 非标量输出同样构造全 1 梯度（数学上等价于显式 ones 梯度），与 PyTorch 的标量检查不同，
+        // 属教学框架的宽容语义；默认梯度经 Fill kernel 按 float 填充，当前仅支持框架使用的 float32 路径。
+        gradient = std::make_shared<Tensor>(dims_, dtype_, GetDevice());
+        gradient->Fill<float>(1.0f);
+    } else {
+        // 透传前校验梯度形状与设备一致，防止元素错位静默累加与越界写
+        CHECK(gradient->Dims() == dims_) << "Backward gradient shape mismatch";
+        CHECK_EQ(static_cast<int>(gradient->GetDevice().Type()), static_cast<int>(GetDevice().Type()))
+            << "Backward gradient device mismatch";
+    }
+    if (grad_fn_) {
+        grad_fn_->BackwardPartial(gradient, output_idx_);
+    }
+    // 契约说明（与 PyTorch 语义的差异）：同一计算图仅可传播一次，重复传播为未定义行为；
+    // retain_graph/create_graph 参数当前无效果；无梯度函数的张量（叶子）调用为空操作。
 }
 
 void Tensor::ZeroGrad() {

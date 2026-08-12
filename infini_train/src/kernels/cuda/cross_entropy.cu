@@ -1,3 +1,9 @@
+// 注意：libcu++ 头（cuda/std/*）必须先于任何标准库头包含：CUDA 13 自带的 CUB 3.x 满足下方版本条件，
+// 需要 <cuda/std/functional>，若标准库头先被包含会导致编译错误。
+#if defined(CUB_VERSION) && CUB_VERSION >= 200800
+#include <cuda/std/functional>
+#endif
+
 #include <cmath>
 #include <cstdint>
 #include <cub/block/block_reduce.cuh>
@@ -17,7 +23,6 @@ constexpr float kNegativeInfinity = -std::numeric_limits<float>::infinity();
 }
 
 #if defined(CUB_VERSION) && CUB_VERSION >= 200800
-    #include <cuda/std/functional>
     using CubSumOp = ::cuda::std::plus<>;
     using CubMaxOp = ::cuda::maximum<>;
     using CubMinOp = ::cuda::minimum<>;

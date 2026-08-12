@@ -2,3 +2,5 @@ build/
 .cache/
 .vscode/
 Data/
+review
+.claude
