@@ -1,5 +1,6 @@
 #include "example/gpt2/net.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
@@ -265,17 +266,25 @@ std::unique_ptr<GPT2> GPT2::FromLLMC(const std::string &filepath) {
         .block_size = block_size, .vocab_size = vocab_size, .n_layer = n_layer, .n_head = n_head, .n_embd = n_embd});
 
     const auto padded_vocab_size = BytesToType<uint32_t>(header, 28);
-    LOG(ERROR) << "magic: " << magic << " version: " << version << " block_size: " << block_size
-               << " vocab_size: " << vocab_size << " n_layer: " << n_layer << " n_head: " << n_head
-               << " n_embd: " << n_embd << " padded_vocab_size: " << padded_vocab_size;
 
     auto state_dict = gpt2->StateDict();
     // transformer.wte.weight
     // (padded_vocab_size, n_embd) -> un_pad -> (vocab_size, n_embd)
-    auto &transformer_wte_weight = state_dict[std::format("{}.{}.{}", GPT2::kTransformerLayerName, GPT2::kWTELayerName,
-                                                          nn::Embedding::kParamWeightName)];
+    auto key = std::format("{}.{}.{}", GPT2::kTransformerLayerName, GPT2::kWTELayerName,
+                           nn::Embedding::kParamWeightName);
+    auto &transformer_wte_weight = state_dict.at(key);
     ifs.read(reinterpret_cast<char *>(transformer_wte_weight->DataPtr()), transformer_wte_weight->SizeInBytes());
-    ifs.ignore((padded_vocab_size - vocab_size) * n_embd * sizeof(float));
+    // Use a small stack buffer to skip the padded part instead of ifs.ignore()
+    {
+        const std::streamsize skip_size = (padded_vocab_size - vocab_size) * n_embd * sizeof(float);
+        char skip_buf[4096];
+        std::streamsize remaining = skip_size;
+        while (remaining > 0) {
+            std::streamsize to_read = std::min(remaining, static_cast<std::streamsize>(sizeof(skip_buf)));
+            ifs.read(skip_buf, to_read);
+            remaining -= to_read;
+        }
+    }
     // transformer.wpe.weight
     auto &transformer_wpe_weight = state_dict[std::format("{}.{}.{}", GPT2::kTransformerLayerName, GPT2::kWPELayerName,
                                                           nn::Embedding::kParamWeightName)];

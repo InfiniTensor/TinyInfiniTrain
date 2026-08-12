@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <cstring>
 #include <fstream>
+#include <iomanip>
 #include <functional>
 #include <memory>
 #include <numeric>
@@ -195,6 +196,12 @@ Tensor Tensor::To(Device device) {
         new_tensor = Tensor(dims_, dtype_, Device(DeviceType::kCUDA, 0));
         cudaMemcpyAsync(new_tensor.DataPtr(), DataPtr(), SizeInBytes(), cudaMemcpyHostToDevice, 0);
         break;
+#else
+    case DeviceType::kCPU:
+        // CPU -> CPU copy
+        new_tensor = Tensor(dims_, dtype_, Device(DeviceType::kCPU, 0));
+        memcpy(new_tensor.DataPtr(), DataPtr(), SizeInBytes());
+        break;
 #endif
     default:
         LOG(FATAL) << "Unsupported device type: " << static_cast<int>(device.Type());
@@ -283,7 +290,29 @@ std::shared_ptr<Tensor> Tensor::Flatten(int64_t start, int64_t end) {
     // HINT:
     // =================================== 作业 ===================================
 
-    return std::make_shared<Tensor>();
+    int64_t ndim = static_cast<int64_t>(dims_.size());
+    if (end < 0) {
+        end += ndim;
+    }
+    CHECK_GE(start, 0);
+    CHECK_LT(start, ndim);
+    CHECK_GE(end, start);
+    CHECK_LT(end, ndim);
+
+    std::vector<int64_t> new_shape;
+    for (int64_t i = 0; i < start; ++i) {
+        new_shape.push_back(dims_[i]);
+    }
+    int64_t flattened_size = 1;
+    for (int64_t i = start; i <= end; ++i) {
+        flattened_size *= dims_[i];
+    }
+    new_shape.push_back(flattened_size);
+    for (int64_t i = end + 1; i < ndim; ++i) {
+        new_shape.push_back(dims_[i]);
+    }
+
+    return Contiguous()->View(new_shape);
 }
 
 std::shared_ptr<Tensor> Tensor::Squeeze(int64_t dim) {
@@ -358,6 +387,21 @@ void Tensor::Backward(std::shared_ptr<Tensor> gradient, bool retain_graph, bool 
     // TODO：实现自动微分反向传播
     // 功能描述：1. 计算当前张量对叶子节点的梯度    2. 支持多输出场景的梯度累加
     // =================================== 作业 ===================================
+
+    if (!gradient) {
+        gradient = std::make_shared<Tensor>(dims_, dtype_, GetDevice());
+        gradient->Fill<float>(1.0f);
+    }
+
+    if (is_leaf_) {
+        if (requires_grad_ && grad_) {
+            auto device = grad_->GetDevice().Type();
+            auto kernel = Dispatcher::Instance().GetKernel({device, "AccumulateGrad"});
+            kernel.Call<void>(gradient, 1.0f, grad_);
+        }
+    } else if (grad_fn_) {
+        grad_fn_->BackwardPartial(gradient, output_idx_);
+    }
 }
 
 void Tensor::ZeroGrad() {

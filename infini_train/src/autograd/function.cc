@@ -6,7 +6,11 @@
 #include "infini_train/include/tensor.h"
 
 namespace infini_train::autograd {
+
+thread_local int NoGradGuard::depth_ = 0;
+
 namespace {
+
 class AccumulateGrad final : public Function {
 public:
     explicit AccumulateGrad(std::shared_ptr<Tensor> grad) : grad_(grad) {}
@@ -35,6 +39,10 @@ private:
 } // namespace
 
 std::vector<std::shared_ptr<Tensor>> Function::Apply(const std::vector<std::shared_ptr<Tensor>> &input_tensors) {
+    if (NoGradGuard::is_enabled()) {
+        return Forward(input_tensors);
+    }
+
     auto output_tensors = Forward(input_tensors);
     SetupContext(input_tensors, output_tensors);
 
