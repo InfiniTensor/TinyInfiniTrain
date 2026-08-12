@@ -220,6 +220,11 @@ GPT2::Forward(const std::vector<std::shared_ptr<infini_train::Tensor>> &x) {
     return logits;
 }
 
+void GPT2::TieWeights() {
+    *mutable_module(kTransformerLayerName)->mutable_module(kWTELayerName)->mutable_parameter(nn::Embedding::kParamWeightName)
+        = module(kLMHeadLayerName).parameter(nn::Linear::kParamWeightName);
+}
+
 std::unique_ptr<GPT2> GPT2::FromPretrained(ModelType model_type) {
     LOG(FATAL) << "Not implemented yet";
     return nullptr;
@@ -230,6 +235,12 @@ std::vector<uint8_t> ReadSeveralBytesFromIfstream(size_t num_bytes, std::ifstrea
     std::vector<uint8_t> result(num_bytes);
     ifs->read(reinterpret_cast<char *>(result.data()), num_bytes);
     return result;
+}
+
+void ReadTensorFromIfstream(const std::shared_ptr<infini_train::Tensor> &tensor, std::ifstream *ifs) {
+    CHECK(tensor);
+    ifs->read(reinterpret_cast<char *>(tensor->DataPtr()), tensor->SizeInBytes());
+    CHECK_EQ(ifs->gcount(), static_cast<std::streamsize>(tensor->SizeInBytes())) << "Truncated model tensor payload";
 }
 
 template <typename T> T BytesToType(const std::vector<uint8_t> &bytes, size_t offset) {
@@ -274,104 +285,107 @@ std::unique_ptr<GPT2> GPT2::FromLLMC(const std::string &filepath) {
     // (padded_vocab_size, n_embd) -> un_pad -> (vocab_size, n_embd)
     auto &transformer_wte_weight = state_dict[std::format("{}.{}.{}", GPT2::kTransformerLayerName, GPT2::kWTELayerName,
                                                           nn::Embedding::kParamWeightName)];
-    ifs.read(reinterpret_cast<char *>(transformer_wte_weight->DataPtr()), transformer_wte_weight->SizeInBytes());
-    ifs.ignore((padded_vocab_size - vocab_size) * n_embd * sizeof(float));
+    ReadTensorFromIfstream(transformer_wte_weight, &ifs);
+    const auto padding_bytes = static_cast<std::streamsize>((padded_vocab_size - vocab_size) * n_embd * sizeof(float));
+    ifs.ignore(padding_bytes);
+    CHECK_EQ(ifs.gcount(), padding_bytes) << "Truncated padded token-embedding payload";
     // transformer.wpe.weight
     auto &transformer_wpe_weight = state_dict[std::format("{}.{}.{}", GPT2::kTransformerLayerName, GPT2::kWPELayerName,
                                                           nn::Embedding::kParamWeightName)];
-    ifs.read(reinterpret_cast<char *>(transformer_wpe_weight->DataPtr()), transformer_wpe_weight->SizeInBytes());
+    ReadTensorFromIfstream(transformer_wpe_weight, &ifs);
     // transformer.h.{i}.ln_1.weight
     for (int idx = 0; idx < n_layer; idx++) {
         auto &tensor
             = state_dict[std::format("{}.{}.{}.{}.{}", GPT2::kTransformerLayerName, GPT2::kHLayerName,
                                      std::to_string(idx), Block::kLn1LayerName, nn::LayerNorm::kParamWeightName)];
-        ifs.read(reinterpret_cast<char *>(tensor->DataPtr()), tensor->SizeInBytes());
+        ReadTensorFromIfstream(tensor, &ifs);
     }
     // transformer.h.{i}.ln_1.bias
     for (int idx = 0; idx < n_layer; idx++) {
         auto &tensor
             = state_dict[std::format("{}.{}.{}.{}.{}", GPT2::kTransformerLayerName, GPT2::kHLayerName,
                                      std::to_string(idx), Block::kLn1LayerName, nn::LayerNorm::kParamBiasName)];
-        ifs.read(reinterpret_cast<char *>(tensor->DataPtr()), tensor->SizeInBytes());
+        ReadTensorFromIfstream(tensor, &ifs);
     }
     // transformer.h.{i}.attn.c_attn.weight
     for (int idx = 0; idx < n_layer; idx++) {
         auto &tensor = state_dict[std::format("{}.{}.{}.{}.{}.{}", GPT2::kTransformerLayerName, GPT2::kHLayerName,
                                               std::to_string(idx), Block::kAttnLayerName,
                                               CausalSelfAttention::kCAttnLayerName, GPT2Linear::kParamWeightName)];
-        ifs.read(reinterpret_cast<char *>(tensor->DataPtr()), tensor->SizeInBytes());
+        ReadTensorFromIfstream(tensor, &ifs);
     }
     // transformer.h.{i}.attn.c_attn.bias
     for (int idx = 0; idx < n_layer; idx++) {
         auto &tensor = state_dict[std::format("{}.{}.{}.{}.{}.{}", GPT2::kTransformerLayerName, GPT2::kHLayerName,
                                               std::to_string(idx), Block::kAttnLayerName,
                                               CausalSelfAttention::kCAttnLayerName, GPT2Linear::kParamBiasName)];
-        ifs.read(reinterpret_cast<char *>(tensor->DataPtr()), tensor->SizeInBytes());
+        ReadTensorFromIfstream(tensor, &ifs);
     }
     // transformer.h.{i}.attn.c_proj.weight
     for (int idx = 0; idx < n_layer; idx++) {
         auto &tensor = state_dict[std::format("{}.{}.{}.{}.{}.{}", GPT2::kTransformerLayerName, GPT2::kHLayerName,
                                               std::to_string(idx), Block::kAttnLayerName,
                                               CausalSelfAttention::kCProjLayerName, GPT2Linear::kParamWeightName)];
-        ifs.read(reinterpret_cast<char *>(tensor->DataPtr()), tensor->SizeInBytes());
+        ReadTensorFromIfstream(tensor, &ifs);
     }
     // transformer.h.{i}.attn.c_proj.bias
     for (int idx = 0; idx < n_layer; idx++) {
         auto &tensor = state_dict[std::format("{}.{}.{}.{}.{}.{}", GPT2::kTransformerLayerName, GPT2::kHLayerName,
                                               std::to_string(idx), Block::kAttnLayerName,
                                               CausalSelfAttention::kCProjLayerName, GPT2Linear::kParamBiasName)];
-        ifs.read(reinterpret_cast<char *>(tensor->DataPtr()), tensor->SizeInBytes());
+        ReadTensorFromIfstream(tensor, &ifs);
     }
     // transformer.h.{i}.ln_2.weight
     for (int idx = 0; idx < n_layer; idx++) {
         auto &tensor
             = state_dict[std::format("{}.{}.{}.{}.{}", GPT2::kTransformerLayerName, GPT2::kHLayerName,
                                      std::to_string(idx), Block::kLn2LayerName, nn::LayerNorm::kParamWeightName)];
-        ifs.read(reinterpret_cast<char *>(tensor->DataPtr()), tensor->SizeInBytes());
+        ReadTensorFromIfstream(tensor, &ifs);
     }
     // transformer.h.{i}.ln_2.bias
     for (int idx = 0; idx < n_layer; idx++) {
         auto &tensor
             = state_dict[std::format("{}.{}.{}.{}.{}", GPT2::kTransformerLayerName, GPT2::kHLayerName,
                                      std::to_string(idx), Block::kLn2LayerName, nn::LayerNorm::kParamBiasName)];
-        ifs.read(reinterpret_cast<char *>(tensor->DataPtr()), tensor->SizeInBytes());
+        ReadTensorFromIfstream(tensor, &ifs);
     }
     // transformer.h.{i}.mlp.c_fc.weight
     for (int idx = 0; idx < n_layer; idx++) {
         auto &tensor = state_dict[std::format("{}.{}.{}.{}.{}.{}", GPT2::kTransformerLayerName, GPT2::kHLayerName,
                                               std::to_string(idx), Block::kMlpLayerName, MLP::kCFclayerName,
                                               GPT2Linear::kParamWeightName)];
-        ifs.read(reinterpret_cast<char *>(tensor->DataPtr()), tensor->SizeInBytes());
+        ReadTensorFromIfstream(tensor, &ifs);
     }
     // transformer.h.{i}.mlp.c_fc.bias
     for (int idx = 0; idx < n_layer; idx++) {
         auto &tensor = state_dict[std::format("{}.{}.{}.{}.{}.{}", GPT2::kTransformerLayerName, GPT2::kHLayerName,
                                               std::to_string(idx), Block::kMlpLayerName, MLP::kCFclayerName,
                                               GPT2Linear::kParamBiasName)];
-        ifs.read(reinterpret_cast<char *>(tensor->DataPtr()), tensor->SizeInBytes());
+        ReadTensorFromIfstream(tensor, &ifs);
     }
     // transformer.h.{i}.mlp.c_proj.weight
     for (int idx = 0; idx < n_layer; idx++) {
         auto &tensor = state_dict[std::format("{}.{}.{}.{}.{}.{}", GPT2::kTransformerLayerName, GPT2::kHLayerName,
                                               std::to_string(idx), Block::kMlpLayerName, MLP::kCProjLayerName,
                                               GPT2Linear::kParamWeightName)];
-        ifs.read(reinterpret_cast<char *>(tensor->DataPtr()), tensor->SizeInBytes());
+        ReadTensorFromIfstream(tensor, &ifs);
     }
     // transformer.h.{i}.mlp.c_proj.bias
     for (int idx = 0; idx < n_layer; idx++) {
         auto &tensor = state_dict[std::format("{}.{}.{}.{}.{}.{}", GPT2::kTransformerLayerName, GPT2::kHLayerName,
                                               std::to_string(idx), Block::kMlpLayerName, MLP::kCProjLayerName,
                                               GPT2Linear::kParamBiasName)];
-        ifs.read(reinterpret_cast<char *>(tensor->DataPtr()), tensor->SizeInBytes());
+        ReadTensorFromIfstream(tensor, &ifs);
     }
     // transformer.ln_f.weight
     auto &transformer_ln_f_weight = state_dict[std::format("{}.{}.{}", GPT2::kTransformerLayerName, GPT2::kLnFLayerName,
                                                            nn::LayerNorm::kParamWeightName)];
-    ifs.read(reinterpret_cast<char *>(transformer_ln_f_weight->DataPtr()), transformer_ln_f_weight->SizeInBytes());
+    ReadTensorFromIfstream(transformer_ln_f_weight, &ifs);
     // transformer.ln_f.bias
     auto &transformer_ln_f_bias = state_dict[std::format("{}.{}.{}", GPT2::kTransformerLayerName, GPT2::kLnFLayerName,
                                                          nn::LayerNorm::kParamBiasName)];
-    ifs.read(reinterpret_cast<char *>(transformer_ln_f_bias->DataPtr()), transformer_ln_f_bias->SizeInBytes());
+    ReadTensorFromIfstream(transformer_ln_f_bias, &ifs);
+    CHECK_EQ(ifs.peek(), std::char_traits<char>::eof()) << "Unexpected trailing model checkpoint data";
 
     return gpt2;
 }

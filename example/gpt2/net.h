@@ -89,6 +89,9 @@ public:
     std::vector<std::shared_ptr<infini_train::Tensor>>
     Forward(const std::vector<std::shared_ptr<infini_train::Tensor>> &x) override;
 
+    void TieWeights();
+    const GPT2Config &config() const { return config_; }
+
     static std::unique_ptr<GPT2> FromPretrained(ModelType model_type);
     static std::unique_ptr<GPT2> FromLLMC(const std::string &filepath);
 

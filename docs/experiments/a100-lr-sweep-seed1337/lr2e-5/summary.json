@@ -1,0 +1,32 @@
+{
+  "status": "complete",
+  "run_state": "complete",
+  "resumed": true,
+  "device": "cuda",
+  "epoch": 5,
+  "global_step": 11925,
+  "next_batch": 0,
+  "train_mean_loss": 2.2658238163732287,
+  "validation_mean_loss": 4.3182362814938715,
+  "validation_perplexity": 75.056133592876421,
+  "validation_perplexity_overflow": false,
+  "best_validation_loss": 3.710212669260581,
+  "train_tokens_per_second": 967.54265701511542,
+  "cuda_async_pool_peak_bytes": 3008656476,
+  "wall_seconds_this_process": 281.19626247000002,
+  "config": {"block_size": 1024, "vocab_size": 50257, "n_layer": 12, "n_head": 12, "n_embd": 768, "batch_size": 2, "sequence_length": 64, "max_epochs": 8, "learning_rate": 2.0000000000000002e-05, "seed": 1337},
+  "dataset_coverage": {
+    "train": {"samples": 4769, "raw_tokens": 305260, "usable_target_tokens": 305216, "dropped_tokens": 43},
+    "validation": {"samples": 511, "raw_tokens": 32768, "usable_target_tokens": 32704, "dropped_tokens": 63}
+  },
+  "artifacts": {
+    "steps_csv": {"path": "steps.csv", "exists": true},
+    "epochs_csv": {"path": "epochs.csv", "exists": true},
+    "latest_checkpoint": {"path": "latest.ckpt", "exists": true},
+    "best_checkpoint": {"path": "best.ckpt", "exists": true},
+    "final_checkpoint": {"path": "final.ckpt", "exists": true},
+    "baseline_generation": {"path": "baseline.txt", "exists": true},
+    "best_generation": {"path": "best.txt", "exists": true},
+    "final_generation": {"path": "final.txt", "exists": true}
+  }
+}
