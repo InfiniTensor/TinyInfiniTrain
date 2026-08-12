@@ -36,6 +36,16 @@ public:
 
     void Step() override;
 
+    int64_t StepCount() const { return t_; }
+    float LearningRate() const { return learning_rate_; }
+    float Beta1() const { return beta1_; }
+    float Beta2() const { return beta2_; }
+    float Epsilon() const { return eps_; }
+    const std::vector<std::shared_ptr<Tensor>> &FirstMoments() const { return m_; }
+    const std::vector<std::shared_ptr<Tensor>> &SecondMoments() const { return v_; }
+    void LoadState(int64_t step, const std::vector<std::shared_ptr<Tensor>> &first_moments,
+                   const std::vector<std::shared_ptr<Tensor>> &second_moments);
+
 private:
     int64_t t_;
     const float learning_rate_;

@@ -16,3 +16,6 @@ clean:
 test-cpp:
 	@echo
 	cd build/$(TYPE) && make test
+
+train-experiment: build
+	./build/$(TYPE)/train_experiment $(ARGS)

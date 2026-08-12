@@ -6,21 +6,21 @@
 
 namespace infini_train::autograd {
 std::vector<std::shared_ptr<Tensor>> Neg::Forward(const std::vector<std::shared_ptr<Tensor>> &input_tensors) {
-    // =================================== 作业 ===================================
-    // TODO：通过Dispatcher获取设备专属kernel，对输入张量进行取反操作
-    // NOTES: 依赖test_dispatcher，Neg kernel实现已给出
-    // =================================== 作业 ===================================
+    CHECK_EQ(input_tensors.size(), 1);
+    const auto &input = input_tensors[0];
 
-    return std::vector<std::shared_ptr<Tensor>>();
+    auto device = input->GetDevice().Type();
+    auto kernel = Dispatcher::Instance().GetKernel({device, "NegForward"});
+    return {kernel.Call<std::shared_ptr<Tensor>>(input)};
 }
 
 std::vector<std::shared_ptr<Tensor>> Neg::Backward(const std::vector<std::shared_ptr<Tensor>> &grad_outputs) {
-    // =================================== 作业 ===================================
-    // TODO：通过Dispatcher获取设备专属的反向传播kernel，计算梯度
-    // NOTES: 依赖test_dispatcher，Neg的kernel实现已给出
-    // =================================== 作业 ===================================
+    CHECK_EQ(grad_outputs.size(), 1);
+    const auto &grad_output = grad_outputs[0];
 
-    return std::vector<std::shared_ptr<Tensor>>();
+    auto device = grad_output->GetDevice().Type();
+    auto kernel = Dispatcher::Instance().GetKernel({device, "NegBackward"});
+    return {kernel.Call<std::shared_ptr<Tensor>>(grad_output)};
 }
 
 std::vector<std::shared_ptr<Tensor>> Reciprocal::Forward(const std::vector<std::shared_ptr<Tensor>> &input_tensors) {

@@ -51,5 +51,32 @@ void Adam::Step() {
         kernel.Call<void>(grad, param, m, v, learning_rate_, beta1_, beta2_, eps_, t_);
     }
 }
+
+void Adam::LoadState(int64_t step, const std::vector<std::shared_ptr<Tensor>> &first_moments,
+                     const std::vector<std::shared_ptr<Tensor>> &second_moments) {
+    CHECK_GE(step, 0);
+    CHECK_EQ(first_moments.size(), params_.size());
+    CHECK_EQ(second_moments.size(), params_.size());
+
+    std::vector<std::shared_ptr<Tensor>> loaded_m;
+    std::vector<std::shared_ptr<Tensor>> loaded_v;
+    loaded_m.reserve(params_.size());
+    loaded_v.reserve(params_.size());
+    for (size_t idx = 0; idx < params_.size(); ++idx) {
+        const auto &param = params_[idx];
+        const auto &first = first_moments[idx];
+        const auto &second = second_moments[idx];
+        CHECK(first && second);
+        CHECK(first->Dims() == param->Dims());
+        CHECK(second->Dims() == param->Dims());
+        CHECK_EQ(static_cast<int>(first->Dtype()), static_cast<int>(param->Dtype()));
+        CHECK_EQ(static_cast<int>(second->Dtype()), static_cast<int>(param->Dtype()));
+        loaded_m.push_back(std::make_shared<Tensor>(first->To(param->GetDevice())));
+        loaded_v.push_back(std::make_shared<Tensor>(second->To(param->GetDevice())));
+    }
+    t_ = step;
+    m_ = std::move(loaded_m);
+    v_ = std::move(loaded_v);
+}
 } // namespace optimizers
 } // namespace infini_train

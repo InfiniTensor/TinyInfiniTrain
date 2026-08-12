@@ -76,6 +76,9 @@ add_library(example_gpt2 STATIC
 )
 target_link_libraries(example_gpt2 infini_train) 
 
+add_executable(train_experiment example/gpt2/train_experiment.cc)
+target_link_libraries(train_experiment example_gpt2 infini_train)
+
 function(build_test files)
   # Non-recursive glob for skip failed tests
   file(GLOB TEST_SOURCES ${files})
