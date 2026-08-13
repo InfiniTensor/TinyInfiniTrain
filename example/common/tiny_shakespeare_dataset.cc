@@ -94,7 +94,8 @@ TinyShakespeareFile ReadTinyShakespeareFile(const std::string &path, size_t sequ
     }
 
     // dims[0] is used by operator[] as CHECK_LT(idx, dims[0] - 1)
-    const int64_t num_samples = static_cast<int64_t>(num_toks) - static_cast<int64_t>(sequence_length);
+    // Non-overlapping windows (llm.c semantics): sample idx covers tokens[idx*seq_len : (idx+1)*seq_len]
+    const int64_t num_samples = static_cast<int64_t>(num_toks) / static_cast<int64_t>(sequence_length);
     std::vector<int64_t> dims{num_samples + 1, static_cast<int64_t>(sequence_length)};
     return TinyShakespeareFile{type, dims, std::move(tensor)};
 }
@@ -106,7 +107,7 @@ TinyShakespeareDataset::TinyShakespeareDataset(const std::string &filepath, size
     // HINT: 调用ReadTinyShakespeareFile加载数据文件
     // =================================== 作业 ===================================
     : text_file_(ReadTinyShakespeareFile(filepath, sequence_length)), sequence_length_(sequence_length),
-      sequence_size_in_bytes_(sizeof(int64_t)), num_samples_(text_file_.dims[0] - 1) {}
+      sequence_size_in_bytes_(sequence_length * sizeof(int64_t)), num_samples_(text_file_.dims[0] - 1) {}
 
 std::pair<std::shared_ptr<infini_train::Tensor>, std::shared_ptr<infini_train::Tensor>>
 TinyShakespeareDataset::operator[](size_t idx) const {
