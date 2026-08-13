@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -61,15 +62,52 @@ TinyShakespeareFile ReadTinyShakespeareFile(const std::string &path, size_t sequ
     | magic(4B) | version(4B) | num_toks(4B) | reserved(1012B) | token数据           |
     ----------------------------------------------------------------------------------
        =================================== 作业 =================================== */
+    std::ifstream ifs(path, std::ios::binary);
+    CHECK(ifs.is_open()) << "Failed to open file: " << path;
+
+    auto header_bytes = ReadSeveralBytesFromIfstream(1024, &ifs);
+    const uint32_t magic = BytesToType<uint32_t>(header_bytes, 0);
+    const uint32_t version = BytesToType<uint32_t>(header_bytes, 4);
+    const uint32_t num_toks = BytesToType<uint32_t>(header_bytes, 8);
+    (void)version;
+
+    CHECK(kTypeMap.contains(magic)) << "Unsupported magic number: " << magic;
+    const TinyShakespeareType type = kTypeMap.at(magic);
+    const size_t token_size = kTypeToSize.at(type);
+
+    CHECK_GT(num_toks, sequence_length) << "Not enough tokens for one sequence";
+    infini_train::Tensor tensor(std::vector<int64_t>{static_cast<int64_t>(num_toks)}, DataType::kINT64);
+    auto *dst = static_cast<int64_t *>(tensor.DataPtr());
+
+    if (token_size == 2) {
+        std::vector<uint16_t> tokens(num_toks);
+        ifs.read(reinterpret_cast<char *>(tokens.data()), static_cast<std::streamsize>(num_toks * token_size));
+        for (uint32_t i = 0; i < num_toks; ++i) {
+            dst[i] = static_cast<int64_t>(tokens[i]);
+        }
+    } else {
+        std::vector<uint32_t> tokens(num_toks);
+        ifs.read(reinterpret_cast<char *>(tokens.data()), static_cast<std::streamsize>(num_toks * token_size));
+        for (uint32_t i = 0; i < num_toks; ++i) {
+            dst[i] = static_cast<int64_t>(tokens[i]);
+        }
+    }
+
+    // dims[0] is used by operator[] as CHECK_LT(idx, dims[0] - 1)
+    // Non-overlapping windows (llm.c semantics): sample idx covers tokens[idx*seq_len : (idx+1)*seq_len]
+    const int64_t num_samples = static_cast<int64_t>(num_toks) / static_cast<int64_t>(sequence_length);
+    std::vector<int64_t> dims{num_samples + 1, static_cast<int64_t>(sequence_length)};
+    return TinyShakespeareFile{type, dims, std::move(tensor)};
 }
 } // namespace
 
-TinyShakespeareDataset::TinyShakespeareDataset(const std::string &filepath, size_t sequence_length) {
+TinyShakespeareDataset::TinyShakespeareDataset(const std::string &filepath, size_t sequence_length)
     // =================================== 作业 ===================================
     // TODO：初始化数据集实例
     // HINT: 调用ReadTinyShakespeareFile加载数据文件
     // =================================== 作业 ===================================
-}
+    : text_file_(ReadTinyShakespeareFile(filepath, sequence_length)), sequence_length_(sequence_length),
+      sequence_size_in_bytes_(sequence_length * sizeof(int64_t)), num_samples_(text_file_.dims[0] - 1) {}
 
 std::pair<std::shared_ptr<infini_train::Tensor>, std::shared_ptr<infini_train::Tensor>>
 TinyShakespeareDataset::operator[](size_t idx) const {
